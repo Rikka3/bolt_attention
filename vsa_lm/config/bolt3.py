@@ -29,7 +29,7 @@ class Bolt3Attn(nn.Module):
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
         self.S, self.C, self.n_sinks = S, C, 4
         # Stricter merge thresholds preserve exact needle keys/RoPE; slow gamma_u retains distant needles.
-        self.sim_k, self.sim_v, self.gamma_u = 0.94, 0.88, 0.999
+        self.sim_k, self.sim_v, self.gamma_u = 0.94, 0.88, 0.985
 
         self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
@@ -93,6 +93,38 @@ class Bolt3Attn(nn.Module):
             n_filled = 0
 
         util = util * self.gamma_u
+        eligible = torch.ones(bh, l_tok, device=k_raw.device, dtype=torch.bool)
+
+        if n_filled < self.S:
+            with torch.no_grad():
+                n_empty = self.S - n_filled
+                m = min(n_empty, l_tok)
+                if n_filled > 0:
+                    k_read = _apply_rope_pos(ak.view(b, hkv, self.S, hd), pm.view(b, hkv, self.S), inv_freq).view(bh, self.S, hd)
+                    sc = torch.bmm(kp_f, k_read.transpose(-1, -2)).float() * scale + torch.log(mass.clamp_min(1.0)).unsqueeze(1)
+                    sc.masked_fill_(~act.unsqueeze(1), -1e9)
+                    v_hat = torch.bmm(F.softmax(sc, dim=-1).to(dt), av).float()
+                    v_f32 = v_f.float()
+                    rel_err = (v_f32 - v_hat).norm(dim=-1) / (v_f32.norm(dim=-1) + 1e-6)
+                    cos_k = torch.bmm(F.normalize(kr_f.float(), dim=-1), F.normalize(ak.float(), dim=-1).transpose(-1, -2))
+                    cos_k.masked_fill_(~act.unsqueeze(1), 0.0)
+                    score_j = rel_err * (1.0 - cos_k.max(dim=-1).values.clamp(0.0, 1.0))
+                    init_u = rel_err
+                else:
+                    score_j = F.normalize(v_f.float(), dim=-1).var(dim=-1)
+                    init_u = torch.full((bh, l_tok), 0.15, device=k_raw.device, dtype=torch.float32)
+                top_toks = torch.topk(score_j, k=m, dim=-1, largest=True).indices
+                slot_ids = torch.arange(n_filled, n_filled + m, device=k_raw.device).unsqueeze(0).expand(bh, -1)
+            ak = ak.scatter(1, slot_ids.unsqueeze(-1).expand(-1, -1, hd), torch.gather(kr_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd)))
+            av = av.scatter(1, slot_ids.unsqueeze(-1).expand(-1, -1, hd), torch.gather(v_f, 1, top_toks.unsqueeze(-1).expand(-1, -1, hd)))
+            pm = pm.scatter(1, slot_ids, torch.gather(p_f, 1, top_toks))
+            mass = mass.scatter(1, slot_ids, torch.ones(bh, m, device=k_raw.device, dtype=torch.float32))
+            util = util.scatter(1, slot_ids, torch.gather(init_u, 1, top_toks))
+            act = act.scatter(1, slot_ids, torch.ones(bh, m, device=k_raw.device, dtype=torch.bool))
+            n_filled = n_filled + m
+            if l_tok <= m:
+                return ak, av, mass, util, pm, act, m_res, n_filled
+            eligible = ~torch.zeros(bh, l_tok, device=k_raw.device, dtype=torch.bool).scatter(1, top_toks, True)
 
         if n_filled >= self.S:
             k_read = _apply_rope_pos(ak.view(b, hkv, self.S, hd), pm.view(b, hkv, self.S), inv_freq).view(bh, self.S, hd)
@@ -108,7 +140,7 @@ class Bolt3Attn(nn.Module):
                 matched_av = torch.gather(av.float(), 1, best_slot.unsqueeze(-1).expand(-1, -1, hd))
                 sim_v = F.cosine_similarity(v_f32, matched_av, dim=-1)
                 score_j = rel_err * (1.0 - best_sim_k.clamp(0.0, 1.0))
-                merge_mask = (best_sim_k >= self.sim_k) & (sim_v >= self.sim_v)
+                merge_mask = eligible & (best_sim_k >= self.sim_k) & (sim_v >= self.sim_v)
 
             # Branchless merge (no CPU-GPU sync)
             m_oh = F.one_hot(best_slot, num_classes=self.S).float() * merge_mask.float().unsqueeze(-1)
@@ -124,7 +156,7 @@ class Bolt3Attn(nn.Module):
             mass = torch.where(hit, new_m, mass)
 
             # Branchless eviction + delta update (no CPU-GPU sync)
-            ev_mask = ~merge_mask
+            ev_mask = eligible & (~merge_mask)
             with torch.no_grad():
                 ak_n2 = F.normalize(ak.float(), dim=-1)
                 pair_cos = torch.bmm(ak_n2, ak_n2.transpose(-1, -2)).masked_fill(diag_eye, -1.0)
@@ -251,7 +283,7 @@ class Bolt3Attn(nn.Module):
             if ak is not None:
                 with torch.no_grad():
                     att_off = sink_k.shape[2] if sink_k is not None else 0
-                    att_hit = probs[:, :, :, att_off:att_off + self.S].view(b, self.HKV, self.G, tc, self.S).amax(dim=(2, 3)).reshape(b * self.HKV, self.S)
+                    att_hit = 0.25 * probs[:, :, :, att_off:att_off + self.S].view(b, self.HKV, self.G, tc, self.S).mean(dim=(2, 3)).reshape(b * self.HKV, self.S)
                     util = torch.maximum(util, att_hit)
             yc = torch.matmul(probs.to(v_cat.dtype), v_cat)
 
@@ -413,7 +445,7 @@ class Bolt3Decoder:
                     probs = F.softmax(scores, dim=-1)
                     if sc["ak"] is not None:
                         att_off = sc["sink_k"].shape[2] if sc["sink_k"] is not None else 0
-                        att_hit = probs[:, :, :, att_off:att_off + ly.S].view(b, ly.HKV, ly.G, t_s, ly.S).amax(dim=(2, 3)).reshape(b * ly.HKV, ly.S)
+                        att_hit = 0.25 * probs[:, :, :, att_off:att_off + ly.S].view(b, ly.HKV, ly.G, t_s, ly.S).mean(dim=(2, 3)).reshape(b * ly.HKV, ly.S)
                         sc["util"] = torch.maximum(sc["util"], att_hit)
                     y = torch.matmul(probs.to(v_cat.dtype), v_cat)
 

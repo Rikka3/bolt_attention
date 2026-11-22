@@ -669,7 +669,7 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
 
 def _kd_microbatch_backward(stu, donor, is_hf_donor: bool, w_lm_t: torch.Tensor, xm: torch.Tensor, ym: torch.Tensor,
                             w: float, kd: float, use_ckpt: bool, loss_mask: torch.Tensor | None = None,
-                            tok_slice: int = 2048, ckpt_stride: int = 1) -> torch.Tensor:
+                            tok_slice: int = 512, ckpt_stride: int = 1) -> torch.Tensor:
     """One distillation micro-batch: teacher forward, student forward, hidden-state cosine at every softmax
     anchor + final norm, and the KD(+CE) gradient pushed through the LM head in fp32 token slices.
     Gradients accumulate into .grad scaled by `w`; returns the detached loss contribution.
