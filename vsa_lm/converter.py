@@ -99,7 +99,7 @@ def convert_donor_model(
         cfg["layer_types"] = ["vsa"] * L_c
         cfg["is_bolt3"] = True
         cfg["bolt3_S"] = 256
-        cfg["bolt3_C"] = 128
+        cfg["bolt3_C"] = 256
     if n_vis > 0:
         cfg["visual_sidecar_path"] = vis_path
         cfg["visual_tensors_count"] = n_vis
