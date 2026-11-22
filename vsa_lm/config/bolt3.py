@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..decode import StaticKV
+from ..decode import StaticKV, StreamKV
 from ..surgery import LlamaRMSNorm, LlamaRoPE, repeat_kv
 
 
@@ -28,7 +28,8 @@ class Bolt3Attn(nn.Module):
         qkv_bias = bool(cfg.get("qkv_bias", False))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
         self.S, self.C, self.n_sinks = S, C, 4
-        self.sim_k, self.sim_v, self.gamma_u = 0.88, 0.80, 0.995
+        # Stricter merge thresholds preserve exact needle keys/RoPE; slow gamma_u retains distant needles.
+        self.sim_k, self.sim_v, self.gamma_u = 0.94, 0.88, 0.999
 
         self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
@@ -246,7 +247,13 @@ class Bolt3Attn(nn.Module):
             vp.append(repeat_kv(loc_v, self.G))
             scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
             v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
-            yc = torch.matmul(F.softmax(scores, dim=-1).to(v_cat.dtype), v_cat)
+            probs = F.softmax(scores, dim=-1)
+            if ak is not None:
+                with torch.no_grad():
+                    att_off = sink_k.shape[2] if sink_k is not None else 0
+                    att_hit = probs[:, :, :, att_off:att_off + self.S].view(b, self.HKV, self.G, tc, self.S).amax(dim=(2, 3)).reshape(b * self.HKV, self.S)
+                    util = torch.maximum(util, att_hit)
+            yc = torch.matmul(probs.to(v_cat.dtype), v_cat)
 
             if m_res is not None:
                 q_rn = F.normalize(qc_r.view(b, self.HKV, self.G, tc, self.HD).float(), dim=-1)
@@ -266,8 +273,12 @@ class Bolt3Attn(nn.Module):
                         ns = min(self.n_sinks, p_kp.shape[2])
                         sink_k, sink_v = p_kp[:, :, :ns], p_v[:, :, :ns]
                         p_kr, p_kp, p_v, p_pos, p_b = p_kr[:, :, ns:], p_kp[:, :, ns:], p_v[:, :, ns:], p_pos[:, :, ns:], p_b[:, :, ns:]
+                    ak_d = ak.detach() if ak is not None else None
+                    av_d = av.detach() if av is not None else None
+                    pm_d = pm.detach() if pm is not None else None
+                    mr_d = m_res.detach() if m_res is not None else None
                     ak, av, mass, util, pm, act, m_res, n_filled = self._consolidate_functional(
-                        ak, av, mass, util, pm, act, m_res, p_kr, p_kp, p_v, p_pos, p_b, inv_freq, diag_eye, gam,
+                        ak_d, av_d, mass, util, pm_d, act, mr_d, p_kr, p_kp, p_v, p_pos, p_b, inv_freq, diag_eye, gam,
                         n_filled=n_filled,
                     )
                 prev_kr, prev_kp, prev_v, prev_pos, prev_b = kc_r, kc_p, vc, pos_c, bc
@@ -277,10 +288,12 @@ class Bolt3Attn(nn.Module):
 
 
 class Bolt3Decoder:
-    def __init__(self, model, wrap_positions: bool = False, max_cache_pos: int = 65536, **kwargs):
+    def __init__(self, model, wrap_positions: bool = False, max_cache_pos: int = 65536,
+                 stream_window: int | None = None, stream_sinks: int = 4, **kwargs):
         self.model = model.eval()
         self.max_T = model.config["max_T"]
         self.max_cache_pos = max_cache_pos
+        self.stream = (int(stream_sinks), int(stream_window)) if stream_window else None
         self._diag_eye_cache = {}
         self.C = int(model.config.get("bolt3_C", 128))
 
@@ -300,7 +313,8 @@ class Bolt3Decoder:
         return flat, per_tok
 
     @staticmethod
-    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32, **kwargs):
+    def blank_state(model, batch_size: int, device, max_kv_len: int = 4096, state_dtype=torch.float32,
+                    stream: tuple[int, int] | None = None, **kwargs):
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
         dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         for li, blk in enumerate(model.blocks):
@@ -315,7 +329,10 @@ class Bolt3Decoder:
                 }
             else:
                 s = blk.attn
-                kv_caches[li] = StaticKV(batch_size, s.HKV, max_kv_len, s.HD, device, dt=dt)
+                if stream is not None:
+                    kv_caches[li] = StreamKV(batch_size, s.HKV, stream[0], stream[1], s.HD, device, dt=dt)
+                else:
+                    kv_caches[li] = StaticKV(batch_size, s.HKV, max_kv_len, s.HD, device, dt=dt)
         return states, kv_caches
 
     @staticmethod
@@ -393,7 +410,12 @@ class Bolt3Decoder:
                     vp.append(repeat_kv(loc_v, ly.G))
                     scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
                     v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
-                    y = torch.matmul(F.softmax(scores, dim=-1).to(v_cat.dtype), v_cat)
+                    probs = F.softmax(scores, dim=-1)
+                    if sc["ak"] is not None:
+                        att_off = sc["sink_k"].shape[2] if sc["sink_k"] is not None else 0
+                        att_hit = probs[:, :, :, att_off:att_off + ly.S].view(b, ly.HKV, ly.G, t_s, ly.S).amax(dim=(2, 3)).reshape(b * ly.HKV, ly.S)
+                        sc["util"] = torch.maximum(sc["util"], att_hit)
+                    y = torch.matmul(probs.to(v_cat.dtype), v_cat)
 
                     if states[li] is not None:
                         q_rn = F.normalize(q_r.view(b, ly.HKV, ly.G, t_s, ly.HD).float(), dim=-1)
@@ -427,6 +449,13 @@ class Bolt3Decoder:
                     ly = blk.attn
                     q, k, v = ly.head_qkv(h)
                     q, k = ly.rope(q, pos_start=pos_start), ly.rope(k, pos_start=pos_start)
+                    if isinstance(kv_caches[li], StreamKV):
+                        inv64 = ly.rope.inv_freq.to(tokens.device, dtype=torch.float64)
+                        ys_st = [kv_caches[li].attend(q[:, :, ti:ti+1], k[:, :, ti:ti+1], v[:, :, ti:ti+1], ly.G, inv64) for ti in range(t_s)]
+                        y = torch.cat(ys_st, dim=2)
+                        x = x + ly.o_proj(y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD))
+                        x = x + blk.mlp(blk.norm2(x))
+                        continue
                     n_prev = kv_caches[li].n
                     pk, pv = kv_caches[li].append(k, v)
                     if t_s > 1:
@@ -449,7 +478,7 @@ class Bolt3Decoder:
     @torch.no_grad()
     def prefill(self, ids: torch.Tensor, max_kv_len: int = 4096):
         b, t = ids.shape
-        states, kv = self.blank_state(self.model, b, ids.device, max_kv_len=max(max_kv_len, t + 1024))
+        states, kv = self.blank_state(self.model, b, ids.device, max_kv_len=max(max_kv_len, t + 1024), stream=self.stream)
         h = None
         for s in range(0, t, self.C):
             e = min(t, s + self.C)

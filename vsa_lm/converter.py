@@ -96,10 +96,9 @@ def convert_donor_model(
     cfg["vsa_mix_before_rope"] = True
     if bolt3:
         L_c = int(cfg["num_layers"])
-        anchors = {12, 16, 20, 24, 28, 32} if L_c == 36 else set(range(max(1, L_c // 3), max(2, L_c - 2), max(1, (L_c - 2) // 6)))
-        cfg["layer_types"] = ["softmax" if li in anchors else "vsa" for li in range(L_c)]
+        cfg["layer_types"] = ["vsa"] * L_c
         cfg["is_bolt3"] = True
-        cfg["bolt3_S"] = 128
+        cfg["bolt3_S"] = 256
         cfg["bolt3_C"] = 128
     if n_vis > 0:
         cfg["visual_sidecar_path"] = vis_path
@@ -931,12 +930,25 @@ def heal_universal_model(
     last_step_done = start_step
     try:
         for step in range(start_step, total_steps):
-            if False:
-                x, y = _build_procedural_binder_batch(binder_tok, bs, T, step, device)
-            else:
-                idx = torch.randint(0, n_win, (bs,), generator=gen)
-                base = idx[:, None] * T + ar[None, :]
-                x, y = train_tokens[base].long(), train_tokens[base + 1].long()
+            idx = torch.randint(0, n_win, (bs,), generator=gen)
+            base = idx[:, None] * T + ar[None, :]
+            x, y = train_tokens[base].long(), train_tokens[base + 1].long()
+            if step % 4 == 0:
+                rng_n = random.Random(700000 + step)
+                for r_i in range(bs):
+                    s1, s2 = rng_n.sample(('Orion', 'Hemlock', 'Vanguard', 'Chronos', 'Lyra', 'Titan'), 2)
+                    c1, c2 = rng_n.randint(10000, 99999), rng_n.randint(10000, 99999)
+                    nd1 = binder_tok.encode(f' [MEMO: Secret code for Project {s1} is {c1}.] ', add_special_tokens=False)
+                    nd2 = binder_tok.encode(f' [MEMO: Secret code for Project {s2} is {c2}.] ', add_special_tokens=False)
+                    qs, qc = (s1, c1) if r_i % 2 == 0 else (s2, c2)
+                    qa = binder_tok.encode(f'\nQuestion: What is the secret code for Project {qs}? Answer: {qc}.', add_special_tokens=False)
+                    row_seq = x[r_i].tolist() + [int(y[r_i, -1].item())]
+                    p1, p2 = rng_n.randint(64, 300), rng_n.randint(500, 900)
+                    row_seq[p1:p1+len(nd1)] = nd1
+                    row_seq[p2:p2+len(nd2)] = nd2
+                    row_seq[-len(qa):] = qa
+                    t_r = torch.tensor(row_seq[:T+1], dtype=torch.long)
+                    x[r_i], y[r_i] = t_r[:-1], t_r[1:]
             opt.zero_grad(set_to_none=True)
             loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
 
@@ -975,7 +987,7 @@ def heal_universal_model(
                               opt=opt if step_done < total_steps else None, opt_ckpt=opt_ckpt)
                 if step_done >= total_steps and os.path.isfile(opt_ckpt):
                     os.remove(opt_ckpt)
-                if hf_repo:
+                if hf_repo and (step_done % 250 == 0 or step_done == total_steps):
                     _upload_hf(out_ckpt, hf_repo, sync=(step_done == total_steps))
     except KeyboardInterrupt:
         print(f"\n  [{out_prefix}] Interrupted at step {last_step_done} — saving checkpoint...", flush=True)
