@@ -683,6 +683,14 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
                 kv_s[li].v[:, :, :T_c].normal_(0, 0.02)
             elif isinstance(kv_s[li], dict) and "swa_n" in kv_s[li]:
                 kv_s[li]["swa_n"].fill_(T_c)
+            elif getattr(getattr(blk, "vsa", None), "is_cold_armed", False) and isinstance(kv_s[li], dict):
+                n_cb = min(blk.vsa.max_cold_blocks, max(1, T_c // blk.vsa.C))
+                kv_s[li]["cold_k_blk"] = torch.randn(1, blk.vsa.HKV, n_cb, blk.vsa.C, blk.vsa.HD, device=device, dtype=torch.bfloat16) * 0.02
+                kv_s[li]["cold_v_blk"] = torch.randn_like(kv_s[li]["cold_k_blk"])
+                kv_s[li]["cold_mask"] = torch.ones(1, blk.vsa.HKV, n_cb, blk.vsa.C, device=device, dtype=torch.bool)
+                kv_s[li]["cold_pos"] = torch.zeros(1, blk.vsa.HKV, n_cb, blk.vsa.C, device=device, dtype=torch.float32)
+                kv_s[li]["cold_kmin"] = kv_s[li]["cold_k_blk"].amin(dim=3)
+                kv_s[li]["cold_kmax"] = kv_s[li]["cold_k_blk"].amax(dim=3)
         vsa_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
 
         dec_stu.step(nxt_tok, T_c, states_s, kv_s)

@@ -98,8 +98,12 @@ def convert_donor_model(
         L_c = int(cfg["num_layers"])
         cfg["layer_types"] = ["vsa"] * L_c
         cfg["is_bolt3"] = True
-        cfg["bolt3_S"] = 256
-        cfg["bolt3_C"] = 256
+        cfg["bolt3_S"] = 128
+        cfg["bolt3_C"] = 128
+        cfg["bolt3_cold_layers"] = [12, 16, 20, 24, 28, 32] if L_c == 36 else [L_c // 3, L_c // 2, (2 * L_c) // 3, L_c - 3]
+        cfg["bolt3_max_cold_blocks"] = 256
+        cfg["bolt3_cold_topk"] = 0
+        cfg["bolt3_freeze_proj"] = True
     if n_vis > 0:
         cfg["visual_sidecar_path"] = vis_path
         cfg["visual_tensors_count"] = n_vis
@@ -605,7 +609,7 @@ def _setup_trainable(stu, stu_cfg: dict, device: torch.device, freeze_mlp: bool 
         elif any(k in n_ for k in ("log_gamma", "k_head_mix", "v_head_mix", "v_self_scale", "out_norm", "swa_mix", "slot_gate", "center_proj", "kappa", "beta_proj", "eta_proj", "res_norm")):
             p_.requires_grad_(True)
             vsa_core.append(p_)
-        elif ".vsa." in n_ and is_vsa_blk:
+        elif ".vsa." in n_ and is_vsa_blk and not stu_cfg.get("bolt3_freeze_proj", False):
             p_.requires_grad_(True)
             vsa_proj.append(p_)
         elif is_vsa_blk and not freeze_mlp and (".mlp." in n_ or ".norm1." in n_ or ".norm2." in n_):
