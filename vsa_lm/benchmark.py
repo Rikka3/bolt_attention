@@ -675,7 +675,7 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         base_mem_stu = torch.cuda.memory_allocated()
-        states_s, kv_s = VSARecurrentDecoder.blank_state(stu, 1, device, max_kv_len=T_c + gen_steps + 32)
+        states_s, kv_s = dec_stu.blank_state(stu, 1, device, max_kv_len=T_c + gen_steps + 32)
         for li, blk in enumerate(stu.blocks):
             if not hasattr(blk, "vsa"):
                 kv_s[li].n = T_c
@@ -691,6 +691,14 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
                 kv_s[li]["cold_pos"] = torch.zeros(1, blk.vsa.HKV, n_cb, blk.vsa.C, device=device, dtype=torch.float32)
                 kv_s[li]["cold_kmin"] = kv_s[li]["cold_k_blk"].amin(dim=3)
                 kv_s[li]["cold_kmax"] = kv_s[li]["cold_k_blk"].amax(dim=3)
+            elif cfg.get("is_bolt3", False) and isinstance(kv_s[li], dict):
+                kv_s[li]["ak"] = torch.randn(blk.vsa.HKV, blk.vsa.S, blk.vsa.HD, device=device, dtype=torch.bfloat16) * 0.02
+                kv_s[li]["av"] = torch.randn_like(kv_s[li]["ak"])
+                kv_s[li]["mass"] = torch.ones(blk.vsa.HKV, blk.vsa.S, device=device, dtype=torch.float32)
+                kv_s[li]["util"] = torch.ones(blk.vsa.HKV, blk.vsa.S, device=device, dtype=torch.float32) * 0.2
+                kv_s[li]["pm"] = torch.arange(blk.vsa.S, device=device, dtype=torch.float32).unsqueeze(0).expand(blk.vsa.HKV, -1).clone()
+                kv_s[li]["act"] = torch.ones(blk.vsa.HKV, blk.vsa.S, device=device, dtype=torch.bool)
+                kv_s[li]["n_filled"] = blk.vsa.S
         vsa_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
 
         dec_stu.step(nxt_tok, T_c, states_s, kv_s)
