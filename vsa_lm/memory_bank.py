@@ -40,7 +40,7 @@ class VSAMemoryBank:
         with torch.autocast("cuda", torch.bfloat16, enabled=(self.device.type == "cuda")):
             router_key = F.normalize(emb_layer(x_in)[0].float().mean(dim=0).cpu(), dim=0)
 
-        states, kv_caches = VSARecurrentDecoder.blank_state(self.model, 1, self.device, max_kv_len=len(ids) + 128)
+        states, kv_caches = self.decoder.blank_state(self.model, 1, self.device, max_kv_len=len(ids) + 128)
         states, kv_caches, next_pos, traces = self.decoder.memorize(x_in, states, kv_caches, start_pos=0)
 
         cpu_states = [s.cpu().float() if s is not None else None for s in states]
