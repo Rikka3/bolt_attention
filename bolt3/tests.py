@@ -287,8 +287,24 @@ def test_left_padded_batch_parity():
         ref2 = dec.generate(p2, 10, temperature=0.0)[0, 53:].tolist()
         batched, _ = dec.generate_batch(ids_b, 10, temperature=0.0, attn_mask=mask_b)
         b1, b2 = batched[0].tolist(), batched[1].tolist()
-    print(f"[left-padded batch parity]  row0={b1 == ref1}  row1={b2 == ref2}")
     assert b1 == ref1 and b2 == ref2
+
+    # Also test short prompts (< C = 16) where prev_valid is None during decode
+    s1 = torch.randint(1, 256, (1, 5), device=dev)
+    s2 = torch.randint(1, 256, (1, 11), device=dev)
+    ids_s = torch.zeros((2, 11), dtype=torch.long, device=dev)
+    mask_s = torch.zeros((2, 11), dtype=torch.long, device=dev)
+    ids_s[0, 6:] = s1[0]
+    mask_s[0, 6:] = 1
+    ids_s[1] = s2[0]
+    mask_s[1] = 1
+    with torch.no_grad():
+        sref1 = dec.generate(s1, 18, temperature=0.0)[0, 5:].tolist()
+        sref2 = dec.generate(s2, 18, temperature=0.0)[0, 11:].tolist()
+        sbat, _ = dec.generate_batch(ids_s, 18, temperature=0.0, attn_mask=mask_s)
+        sb1, sb2 = sbat[0].tolist(), sbat[1].tolist()
+    print(f"[left-padded batch parity]  long=({b1 == ref1},{b2 == ref2})  short<C=({sb1 == sref1},{sb2 == sref2})")
+    assert sb1 == sref1 and sb2 == sref2
 
 
 def run_all():

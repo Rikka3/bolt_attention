@@ -550,12 +550,14 @@ class Bolt3Decoder:
                     "prev_pos": None,
                     "prev_b": None,
                     "prev_valid": None,
+                    "prev_has_pad": False,
                     "cur_kr": None,
                     "cur_kp": None,
                     "cur_v": None,
                     "cur_pos": None,
                     "cur_b": None,
                     "cur_valid": None,
+                    "cur_has_pad": False,
                     "cur_len": 0,
                 }
             else:
@@ -570,7 +572,12 @@ class Bolt3Decoder:
         for c in kv_caches:
             if isinstance(c, dict):
                 for k in list(c.keys()):
-                    c[k] = 0 if k in ("n_filled", "cur_len") else None
+                    if k in ("n_filled", "cur_len"):
+                        c[k] = 0
+                    elif k in ("prev_has_pad", "cur_has_pad"):
+                        c[k] = False
+                    else:
+                        c[k] = None
             elif isinstance(c, StaticKV):
                 c.n = 0
 
@@ -668,6 +675,8 @@ class Bolt3Decoder:
             sc["cur_b"][:, :, len_before:new_len] = beta_n
             if valid_mask is not None:
                 sc["cur_valid"][:, :, len_before:new_len] = valid_mask.unsqueeze(1)
+                if not bool(valid_mask.all()):
+                    sc["cur_has_pad"] = True
             else:
                 sc["cur_valid"][:, :, len_before:new_len] = True
             sc["cur_len"] = new_len
@@ -685,7 +694,7 @@ class Bolt3Decoder:
 
             qg = q_p.view(b, ly.HKV, ly.G, t_s, ly.HD)
             s_loc = torch.matmul(qg.float(), loc_k.float().unsqueeze(2).transpose(-1, -2)) * scale
-            has_pad = not bool(loc_valid.all()) if valid_mask is not None or (sc["prev_valid"] is not None and not bool(sc["prev_valid"].all())) else False
+            has_pad = sc.get("prev_has_pad", False) or sc.get("cur_has_pad", False)
             if t_s > 1 or has_pad:
                 qi = torch.arange(t_s, device=device)[:, None]
                 kj = torch.arange(loc_k.shape[2], device=device)[None, :]
@@ -831,6 +840,7 @@ class Bolt3Decoder:
                 sc["prev_pos"], sc["cur_pos"] = sc["cur_pos"], sc["prev_pos"]
                 sc["prev_b"], sc["cur_b"] = sc["cur_b"], sc["prev_b"]
                 sc["prev_valid"], sc["cur_valid"] = sc["cur_valid"], sc["prev_valid"]
+                sc["prev_has_pad"], sc["cur_has_pad"] = sc.get("cur_has_pad", False), False
                 sc["cur_len"] = 0
         else:
             q, k, v = ly.head_qkv(h)
