@@ -6,7 +6,7 @@ Guidance for coding agents working in the **Bolt-3 Attention** (`bolt3`) reposit
 
 This repository implements **Bolt-3 Dual-Field Attention** (`bolt3`): a pure-PyTorch, constant-memory (`O(1)` inference state) attention architecture for retrofitting pretrained HuggingFace Transformer LLMs (such as `Qwen/Qwen3-4B`, Llama, Mistral, Qwen2/3) into **100% Full Bolt-3** models with **zero pure Softmax layers**.
 
-There is no `pyproject.toml`, `setup.py`, `requirements.txt`, or CI pipeline. Commands run directly from the repository root via `python -m bolt3 <subcommand>`, and ready-to-run Molab (RTX 6000 Pro) notebook scripts live in `cells/`.
+There is no `pyproject.toml`, `setup.py`, `requirements.txt`, or CI pipeline. Commands run directly from the repository root via `python -m bolt3 <subcommand>`. Local Molab (RTX 6000 Pro) cell scripts live in `cells/` (gitignored; never commit or push `cells/` to GitHub).
 
 ### Runtime Dependencies (Observed from Imports)
 - **Core:** `torch` (CUDA recommended for training/healing; CPU works for tests, `scan`, and quantized `serve`), `transformers`, `safetensors`, `huggingface_hub`, `datasets`, `pyarrow`, `tqdm`.
@@ -62,7 +62,7 @@ There is no `pyproject.toml`, `setup.py`, `requirements.txt`, or CI pipeline. Co
 | `bolt3/hubcheck.py` | End-to-end release suite (`load`, `chat`, `decode_parity`, `batch`, `passkey`, `long_ppl`, `memory_bank`, `server`) |
 | `bolt3/benchmark.py` | 7-task evaluation suite + 2k–64k throughput/VRAM scaling + cartridge recall + 4-panel chart |
 | `bolt3/tests.py` | CPU/CUDA unit test suite (`run_all`) |
-| `cells/*.py` | Molab (RTX 6000 Pro) Qwen3-4B workflow scripts (`01`..`07 (latest)`) |
+| `cells/*.py` (local-only) | Gitignored Molab (RTX 6000 Pro) Qwen3-4B scripts — never commit or push to GitHub |
 
 ---
 
@@ -111,4 +111,4 @@ python -m bolt3 serve --ckpt checkpoints/bolt3_qwen3_4b_latest.pth --donor Qwen/
    - Lazy-import heavy packages (`transformers`, `datasets`, `huggingface_hub`, `safetensors`, `matplotlib`, `pyarrow`, `inspect_ai`) inside functions.
    - Chunk `[B*T, V]` logit/KL computations in `_kd_microbatch_backward` and `_nll_from_hidden`, and call `_purge_zombie_vram()` when swapping teacher/student models.
    - Write checkpoints and JSON reports atomically via `<path>.tmp` + `os.replace`.
-   - Keep `cells/` scripts pure Python (resolving `REPO_ROOT` without requiring `__file__` so they work both via `python cells/...py` and pasted directly into Molab cells) and tag the newest cell with ` (latest)` at the end of its basename.
+   - Keep local `cells/` scripts pure Python (resolving `REPO_ROOT` without requiring `__file__` so they work both via `python cells/...py` and pasted directly into Molab cells) and tag the newest cell with ` (latest)` at the end of its basename. **Never commit or upload `cells/` to GitHub (`cells/` is gitignored)** — simply tell the user which cell to run.
