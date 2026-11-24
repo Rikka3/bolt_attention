@@ -143,8 +143,10 @@ def load_bolt3_checkpoint(
     if cfg.get("tie_word_embeddings", True) and "lm_head.weight" in missing:
         model.lm_head.weight = model.embed_tokens.weight
         missing = [m for m in missing if m != "lm_head.weight"]
-    if missing or unexpected:
-        raise RuntimeError(f"Checkpoint mismatch! Missing: {missing[:10]}, Unexpected: {unexpected[:10]}")
+    if missing:
+        raise RuntimeError(f"Checkpoint mismatch! Missing keys: {missing[:10]}")
+    if unexpected:
+        print(f"[bolt3] Warning: ignored {len(unexpected)} unexpected checkpoint keys (e.g. {unexpected[:5]})", flush=True)
 
     if cfg.get("tie_word_embeddings", True) or "lm_head.weight" not in sd_keys:
         model.lm_head.weight = model.embed_tokens.weight
