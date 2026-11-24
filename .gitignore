@@ -3,4 +3,6 @@ __pycache__/
 *.pth
 *.pt
 *.safetensors
+*.vsa
 inspect_logs/
+checkpoints/

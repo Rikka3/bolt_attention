@@ -1,22 +1,22 @@
-"""Infinite Context Disk-Backed Neural State Bank (vsa_lm.memory_bank)."""
+"""Disk-backed Neural State Cartridges for Bolt-3 (`bolt3.memory_bank`)."""
 from __future__ import annotations
 
 import time
 from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 
-from .config.bolt3 import Bolt3Decoder
-from .decode import VSARecurrentDecoder, StaticKV
+from .attention import Bolt3Attn, Bolt3Decoder, StaticKV
 from .server import get_all_eos_ids
 
 
-class VSAMemoryBank:
-    def __init__(self, model, tokenizer, bank_dir: str | Path = "./vsa_memory_bank"):
+class Bolt3MemoryBank:
+    def __init__(self, model, tokenizer, bank_dir: str | Path = "./bolt3_memory_bank"):
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.device = next(model.parameters()).device
-        self.decoder = Bolt3Decoder(self.model) if getattr(self.model, "config", {}).get("is_bolt3", False) else VSARecurrentDecoder(self.model, wrap_positions=False)
+        self.decoder = Bolt3Decoder(self.model)
         self.bank_dir = Path(bank_dir)
         self.bank_dir.mkdir(parents=True, exist_ok=True)
         self.index: dict[str, torch.Tensor] = {}
@@ -32,13 +32,12 @@ class VSAMemoryBank:
 
     @torch.no_grad()
     def memorize_to_disk(self, doc_name: str, text: str) -> Path:
-        emb_layer = self.model.embed_tokens if hasattr(self.model, "embed_tokens") else self.model.embed
         doc_prefix = f"Context: {text.strip()}\n"
         ids = self.tokenizer.encode(doc_prefix, add_special_tokens=False)
         x_in = torch.tensor([ids], dtype=torch.long, device=self.device)
 
         with torch.autocast("cuda", torch.bfloat16, enabled=(self.device.type == "cuda")):
-            router_key = F.normalize(emb_layer(x_in)[0].float().mean(dim=0).cpu(), dim=0)
+            router_key = F.normalize(self.model.embed_tokens(x_in)[0].float().mean(dim=0).cpu(), dim=0)
 
         states, kv_caches = self.decoder.blank_state(self.model, 1, self.device, max_kv_len=len(ids) + 128)
         states, kv_caches, next_pos, traces = self.decoder.memorize(x_in, states, kv_caches, start_pos=0)
@@ -47,25 +46,30 @@ class VSAMemoryBank:
         cpu_kv = []
         for item in kv_caches:
             if isinstance(item, StaticKV):
-                cpu_kv.append((item.k[:, :, :item.n].cpu(), item.v[:, :, :item.n].cpu()))
-            elif isinstance(item, tuple):
-                cpu_kv.append((item[0].cpu(), item[1].cpu()))
+                cpu_kv.append((item.k[:, :, : item.n].cpu(), item.v[:, :, : item.n].cpu()))
             elif isinstance(item, dict):
                 cpu_kv.append({k: (v.cpu() if torch.is_tensor(v) else v) for k, v in item.items()})
             else:
                 cpu_kv.append(None)
-        cpu_traces = [[(p, k.cpu(), v.cpu()) for (p, k, v) in tr] for tr in traces]
+
+        cpu_traces = [
+            None if tr is None else (int(tr[0]), tr[1].cpu().float())
+            for tr in traces
+        ]
 
         cart_path = self.bank_dir / f"{doc_name}.vsa"
-        torch.save({
-            "doc_name": doc_name,
-            "router_key": router_key,
-            "vsa_states": cpu_states,
-            "kv_caches": cpu_kv,
-            "traces": cpu_traces,
-            "next_pos": next_pos,
-            "n_tokens": len(ids),
-        }, cart_path)
+        torch.save(
+            {
+                "doc_name": doc_name,
+                "router_key": router_key,
+                "states": cpu_states,
+                "kv_caches": cpu_kv,
+                "traces": cpu_traces,
+                "next_pos": next_pos,
+                "n_tokens": len(ids),
+            },
+            cart_path,
+        )
         self.index[doc_name] = router_key
         return cart_path
 
@@ -79,9 +83,8 @@ class VSAMemoryBank:
 
     @torch.no_grad()
     def route(self, query: str, top_k: int = 1) -> list[tuple[str, float]]:
-        emb_layer = self.model.embed_tokens if hasattr(self.model, "embed_tokens") else self.model.embed
         q_ids = self.tokenizer.encode(query, add_special_tokens=False)
-        q_emb = emb_layer(torch.tensor([q_ids], device=self.device))[0].float().mean(dim=0).cpu()
+        q_emb = self.model.embed_tokens(torch.tensor([q_ids], device=self.device))[0].float().mean(dim=0).cpu()
         q_emb = F.normalize(q_emb, dim=0)
         scored = [(name, float(torch.dot(q_emb, rkey).item())) for name, rkey in self.index.items()]
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -92,43 +95,60 @@ class VSAMemoryBank:
         t0 = time.perf_counter()
         hits = self.route(question, top_k=1)
         if not hits:
-            raise RuntimeError("VSAMemoryBank is empty — call memorize_to_disk() first!")
+            raise RuntimeError("Bolt3MemoryBank is empty — call memorize_to_disk() first!")
         best_name, score = hits[0]
         cart = torch.load(self.bank_dir / f"{best_name}.vsa", map_location="cpu", weights_only=False)
         route_ms = (time.perf_counter() - t0) * 1000.0
 
-        states = [s.to(self.device, dtype=torch.float32) if s is not None else None for s in cart["vsa_states"]]
+        raw_states = cart.get("states", cart.get("vsa_states"))
+        states = [s.to(self.device, dtype=torch.float32) if s is not None else None for s in raw_states]
         kv_caches = []
         for item in cart["kv_caches"]:
             if isinstance(item, tuple):
                 k_t, v_t = item[0].to(self.device), item[1].to(self.device)
-                skv = StaticKV(k_t.shape[0], k_t.shape[1], k_t.shape[2] + max_new_tokens + 64, k_t.shape[3], self.device, dt=k_t.dtype)
+                skv = StaticKV(
+                    k_t.shape[0], k_t.shape[1], k_t.shape[2] + max_new_tokens + 64, k_t.shape[3],
+                    self.device, dt=k_t.dtype,
+                )
                 skv.append(k_t, v_t)
                 kv_caches.append(skv)
             elif isinstance(item, dict):
                 kv_caches.append({k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in item.items()})
             else:
                 kv_caches.append(None)
-        traces = [[(p, k.to(self.device), v.to(self.device)) for (p, k, v) in tr] for tr in cart["traces"]]
+
+        traces = [
+            None if tr is None else (int(tr[0]), tr[1].to(self.device, dtype=torch.float32))
+            for tr in cart["traces"]
+        ]
         doc_next_pos = int(cart["next_pos"])
 
         states_to_erase = [s.clone() if s is not None else None for s in states]
         erased_states = self.decoder.forget(traces, states_to_erase, next_pos=doc_next_pos)
-        max_erase_err = max(
+        errs = [
             float(es.abs().max().item())
             for li_e, es in enumerate(erased_states)
-            if es is not None and hasattr(self.model.blocks[li_e], "vsa") and getattr(self.model.blocks[li_e].vsa, "mode", None) != "gated_deltanet"
-        )
+            if es is not None and isinstance(self.model.blocks[li_e].attn, Bolt3Attn)
+        ]
+        max_erase_err = max(errs) if errs else 0.0
 
         q_prompt = f"Question: {question.strip()}\nAnswer:"
-        q_ids = torch.tensor([self.tokenizer.encode(q_prompt, add_special_tokens=False)], dtype=torch.long, device=self.device)
+        q_ids = torch.tensor(
+            [self.tokenizer.encode(q_prompt, add_special_tokens=False)], dtype=torch.long, device=self.device
+        )
         eos_ids = get_all_eos_ids(self.tokenizer)
 
         gen_toks, _, _, _ = self.decoder.continue_generate(
-            q_ids, states, kv_caches, start_pos=doc_next_pos,
-            max_new_tokens=max_new_tokens, temperature=0.0, eos_ids=eos_ids,
+            q_ids,
+            states,
+            kv_caches,
+            start_pos=doc_next_pos,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            eos_ids=eos_ids,
         )
-        answer = self.tokenizer.decode(gen_toks[0].tolist(), skip_special_tokens=True).strip().splitlines()[0].strip()
+        decoded = self.tokenizer.decode(gen_toks[0].tolist(), skip_special_tokens=True).strip()
+        answer = decoded.splitlines()[0].strip() if decoded else ""
 
         return dict(
             cartridge=best_name,
