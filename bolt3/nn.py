@@ -15,6 +15,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == self.weight.dtype and hasattr(F, "rms_norm"):
+            return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
         dt = x.dtype
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -54,6 +56,14 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
+def apply_rope_cos_sin(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rot_dim: int) -> torch.Tensor:
+    """Apply precomputed `(cos, sin)` tables of shape `(..., T, rot_dim)` to `(B, H, T, HD)`."""
+    if rot_dim < x.shape[-1]:
+        xr, xp = x[..., :rot_dim], x[..., rot_dim:]
+        return torch.cat(((xr * cos) + (rotate_half(xr) * sin), xp), dim=-1)
+    return (x * cos) + (rotate_half(x) * sin)
+
+
 def apply_rope_pos(x: torch.Tensor, pos: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor:
     """Apply rotary position embeddings to (B, H, S, HD) keys with per-slot positions (B, H, S)."""
     rot_dim = inv_freq.numel() * 2
@@ -61,10 +71,7 @@ def apply_rope_pos(x: torch.Tensor, pos: torch.Tensor, inv_freq: torch.Tensor) -
     emb = torch.cat((freqs, freqs), dim=-1)
     cos = emb.cos().to(x.dtype)
     sin = emb.sin().to(x.dtype)
-    if rot_dim < x.shape[-1]:
-        xr, xp = x[..., :rot_dim], x[..., rot_dim:]
-        return torch.cat(((xr * cos) + (rotate_half(xr) * sin), xp), dim=-1)
-    return (x * cos) + (rotate_half(x) * sin)
+    return apply_rope_cos_sin(x, cos, sin, rot_dim)
 
 
 class RoPE(nn.Module):
@@ -82,17 +89,22 @@ class RoPE(nn.Module):
         self.rotary_dim = rot_dim
         self.register_buffer("inv_freq", buf, persistent=False)
 
-    def forward(self, x: torch.Tensor, pos_start: int = 0) -> torch.Tensor:
-        T = x.shape[2]
-        t = torch.arange(pos_start, pos_start + T, device=x.device, dtype=torch.float32)
-        freqs = t[:, None] * self.inv_freq.to(x.device)
+    def cos_sin(
+        self, pos_start: int, T: int, device: torch.device, dtype: torch.dtype, pos_ids: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = self.inv_freq.to(device)
+        if pos_ids is None:
+            t = torch.arange(pos_start, pos_start + T, device=device, dtype=torch.float32)
+            freqs = t[:, None] * inv_freq
+            emb = torch.cat((freqs, freqs), dim=-1)
+            return emb.cos().to(dtype)[None, None], emb.sin().to(dtype)[None, None]
+        freqs = pos_ids.unsqueeze(1).unsqueeze(-1).float() * inv_freq.view(1, 1, 1, -1)
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().to(x.dtype)[None, None]
-        sin = emb.sin().to(x.dtype)[None, None]
-        if self.rotary_dim < x.shape[-1]:
-            xr, xp = x[..., : self.rotary_dim], x[..., self.rotary_dim :]
-            return torch.cat((xr * cos + rotate_half(xr) * sin, xp), dim=-1)
-        return x * cos + rotate_half(x) * sin
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+    def forward(self, x: torch.Tensor, pos_start: int = 0) -> torch.Tensor:
+        cos, sin = self.cos_sin(pos_start, x.shape[2], x.device, x.dtype)
+        return apply_rope_cos_sin(x, cos, sin, self.rotary_dim)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:

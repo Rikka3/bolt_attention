@@ -102,6 +102,8 @@ def main(argv: list[str] | None = None):
     p_bench.add_argument("--gsm8k-limit", type=int, default=200)
     p_bench.add_argument("--batch-size", type=int, default=None, help="Eval batch size override (default: auto 32-64 on 40-96GB GPU)")
     p_bench.add_argument("--tasks", default="", help="Comma-separated task subset (e.g. MMLU,GSM8K)")
+    p_bench.add_argument("--fresh-student", action="store_true", help="Ignore cached student/systems results and re-evaluate Bolt-3 cleanly")
+    p_bench.add_argument("--fresh", action="store_true", help="Ignore entire cached benchmark JSON and re-evaluate both Bolt-3 and donor")
     p_bench.add_argument("--out", default=None)
 
     p_serve = sub.add_parser("serve", help="Start OpenAI-compatible /v1/chat/completions server")
@@ -221,6 +223,8 @@ def main(argv: list[str] | None = None):
             out_json=args.out,
             batch_size=args.batch_size,
             tasks=tuple(x for x in args.tasks.split(",") if x),
+            fresh_student=args.fresh_student,
+            fresh=args.fresh,
         )
     elif args.cmd == "serve":
         from .server import run_server

@@ -303,8 +303,77 @@ def test_left_padded_batch_parity():
         sref2 = dec.generate(s2, 18, temperature=0.0)[0, 11:].tolist()
         sbat, _ = dec.generate_batch(ids_s, 18, temperature=0.0, attn_mask=mask_s)
         sb1, sb2 = sbat[0].tolist(), sbat[1].tolist()
-    print(f"[left-padded batch parity]  long=({b1 == ref1},{b2 == ref2})  short<C=({sb1 == sref1},{sb2 == sref2})")
     assert sb1 == sref1 and sb2 == sref2
+
+    # Verify exact multi-chunk (5+ chunks) hidden-state parity when S == C and rows transition
+    # from partial left-padded fill -> full-chunk consolidation.
+    model2 = (
+        Bolt3LM(
+            vocab_size=128,
+            dim=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate=128,
+            max_T=512,
+            rope_theta=1000000.0,
+            eps=1e-6,
+            qk_norm=True,
+            bolt3_S=16,
+            bolt3_C=16,
+            bolt3_n_sinks=4,
+        )
+        .to(dev)
+        .float()
+        .eval()
+    )
+    with torch.no_grad():
+        for blk in model2.blocks:
+            blk.attn.eta_proj.bias.fill_(0.5)
+            blk.attn.beta_proj.bias.fill_(0.5)
+            blk.attn.res_norm.weight.fill_(1.0)
+    dec2 = Bolt3Decoder(model2)
+    q1 = torch.randint(1, 128, (1, 7), device=dev)
+    q2 = torch.randint(1, 128, (1, 13), device=dev)
+    g1 = torch.randint(1, 128, (1, 64), device=dev)
+    g2 = torch.randint(1, 128, (1, 64), device=dev)
+    with torch.no_grad():
+        h_u2, st2, kv2 = dec2.prefill(q2)
+        hs_u2 = [h_u2[:, -1:]]
+        for i in range(64):
+            hi, st2, kv2 = dec2.step(g2[:, i : i + 1], q2.shape[1] + i, st2, kv2)
+            hs_u2.append(hi)
+        hs_u2 = torch.cat(hs_u2, dim=1)
+
+        xb = torch.zeros((2, 13), dtype=torch.long, device=dev)
+        xb[0, 6:] = q1[0]
+        xb[1] = q2[0]
+        mb = torch.zeros((2, 13), dtype=torch.long, device=dev)
+        mb[0, 6:] = 1
+        mb[1] = 1
+        hb, stb, kvb = dec2.prefill(xb, attn_mask=mb)
+        hs_b = [hb[:, -1:]]
+        rp = mb.long().sum(dim=-1, keepdim=True)
+        gb = torch.cat([g1, g2], dim=0)
+        for i in range(64):
+            hi, stb, kvb = dec2.step(gb[:, i : i + 1], 13 + i, stb, kvb, pos_ids=rp)
+            rp = rp + 1
+            hs_b.append(hi)
+        hs_b = torch.cat(hs_b, dim=1)
+
+        hp0, stp0, kvp0 = dec2.prefill(xb[0:1], attn_mask=mb[0:1])
+        hs_p0 = [hp0[:, -1:]]
+        rp0 = mb[0:1].long().sum(dim=-1, keepdim=True)
+        for i in range(64):
+            hi, stp0, kvp0 = dec2.step(g1[:, i : i + 1], 13 + i, stp0, kvp0, pos_ids=rp0)
+            rp0 = rp0 + 1
+            hs_p0.append(hi)
+        hs_p0 = torch.cat(hs_p0, dim=1)
+
+    d_unpad = float((hs_b[1:2] - hs_u2).abs().max().item())
+    d_pad0 = float((hs_b[0:1] - hs_p0).abs().max().item())
+    print(f"[left-padded batch parity]  long=({b1 == ref1},{b2 == ref2})  short<C=({sb1 == sref1},{sb2 == sref2})  5chunk_diff=({d_pad0:.2e},{d_unpad:.2e})")
+    assert d_unpad < 1e-4 and d_pad0 < 1e-4
 
 
 def run_all():

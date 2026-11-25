@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .nn import RMSNorm, RoPE, apply_rope_pos, repeat_kv
+from .nn import RMSNorm, RoPE, apply_rope_cos_sin, apply_rope_pos, repeat_kv
 
 
 class StaticKV:
@@ -138,36 +138,72 @@ class Bolt3Attn(nn.Module):
         if tok_valid is not None:
             row_has_valid = tok_valid.any(dim=-1)
             util = torch.where(row_has_valid.unsqueeze(-1), util * self.gamma_u, util)
-            has_any_act = act.any(dim=-1, keepdim=True)
-            k_read = apply_rope_pos(
-                ak.view(b, hkv, self.S, hd), pm.view(b, hkv, self.S), inv_freq
-            ).view(bh, self.S, hd)
-            with torch.no_grad():
-                sc = torch.bmm(kp_f, k_read.transpose(-1, -2)).float() * scale + kap * torch.log(
-                    mass.clamp_min(1.0)
-                ).unsqueeze(1)
-                sc.masked_fill_(~act.unsqueeze(1), -1e9)
-                v_hat = torch.where(
-                    has_any_act.unsqueeze(-1),
-                    torch.bmm(F.softmax(sc, dim=-1).to(dt), av).float(),
-                    0.0,
-                )
-                v_f32 = v_f.float()
-                rel_err = (v_f32 - v_hat).norm(dim=-1) / (v_f32.norm(dim=-1) + 1e-6)
-                ak_n = F.normalize(ak.float(), dim=-1)
-                cos_k = torch.bmm(F.normalize(kr_f.float(), dim=-1), ak_n.transpose(-1, -2))
-                cos_k.masked_fill_(~act.unsqueeze(1), -1.0)
-                best_sim_k, best_slot = cos_k.max(dim=-1)
-                matched_av = torch.gather(av.float(), 1, best_slot.unsqueeze(-1).expand(-1, -1, hd))
-                sim_v = F.cosine_similarity(v_f32, matched_av, dim=-1)
-                var_score = F.normalize(v_f32, dim=-1).var(dim=-1)
-                score_j = torch.where(
-                    has_any_act,
-                    rel_err * (1.0 - best_sim_k.clamp(0.0, 1.0)),
-                    var_score,
-                )
-                init_u = torch.where(has_any_act, rel_err, torch.full_like(rel_err, 0.15))
-                merge_mask = tok_valid & has_any_act.squeeze(-1).unsqueeze(-1) & (best_sim_k >= self.sim_k) & (sim_v >= self.sim_v)
+            eligible = tok_valid
+
+            def _score_masked(ak_in, av_in, mass_in, act_in):
+                has_any = act_in.any(dim=-1, keepdim=True)
+                k_read = apply_rope_pos(
+                    ak_in.view(b, hkv, self.S, hd), pm.view(b, hkv, self.S), inv_freq
+                ).view(bh, self.S, hd)
+                with torch.no_grad():
+                    sc = torch.bmm(kp_f, k_read.transpose(-1, -2)).float() * scale + kap * torch.log(
+                        mass_in.clamp_min(1.0)
+                    ).unsqueeze(1)
+                    sc.masked_fill_(~act_in.unsqueeze(1), -1e9)
+                    v_hat = torch.where(
+                        has_any.unsqueeze(-1),
+                        torch.bmm(F.softmax(sc, dim=-1).to(dt), av_in).float(),
+                        0.0,
+                    )
+                    v_f32 = v_f.float()
+                    rel_err = (v_f32 - v_hat).norm(dim=-1) / (v_f32.norm(dim=-1) + 1e-6)
+                    ak_n = F.normalize(ak_in.float(), dim=-1)
+                    cos_k = torch.bmm(F.normalize(kr_f.float(), dim=-1), ak_n.transpose(-1, -2))
+                    cos_k.masked_fill_(~act_in.unsqueeze(1), -1.0)
+                    best_sim_k, best_slot = cos_k.max(dim=-1)
+                    matched_av = torch.gather(av_in.float(), 1, best_slot.unsqueeze(-1).expand(-1, -1, hd))
+                    sim_v = F.cosine_similarity(v_f32, matched_av, dim=-1)
+                    var_score = F.normalize(v_f32, dim=-1).var(dim=-1)
+                    score_j = torch.where(
+                        has_any,
+                        rel_err * (1.0 - best_sim_k.clamp(0.0, 1.0)),
+                        var_score,
+                    )
+                    init_u = torch.where(has_any, rel_err, torch.full_like(rel_err, 0.15))
+                return has_any, rel_err, best_sim_k, best_slot, sim_v, score_j, init_u
+
+            has_any_act, rel_err, best_sim_k, best_slot, sim_v, score_j, init_u = _score_masked(ak, av, mass, act)
+
+            # Fill any remaining empty attractor slots per (B * HKV) row before merge/eviction
+            n_empty_bh = (~act).sum(dim=-1)
+            max_empty = int(n_empty_bh.max().item())
+            if max_empty > 0:
+                k_fill = min(max_empty, l_tok)
+                with torch.no_grad():
+                    slot_arange = torch.arange(self.S, device=k_raw.device).unsqueeze(0)
+                    empty_pref = torch.where(~act, self.S - slot_arange, -1)
+                    empty_slots = torch.topk(empty_pref, k=k_fill, dim=-1, largest=True).indices
+                    fill_scores = torch.where(tok_valid, score_j, torch.full_like(score_j, -1e9))
+                    top_fill_vals, top_fill_toks = torch.topk(fill_scores, k=k_fill, dim=-1, largest=True)
+                    fill_pos = torch.arange(k_fill, device=k_raw.device).unsqueeze(0)
+                    do_fill = (fill_pos < n_empty_bh.unsqueeze(-1)) & (top_fill_vals > -1e8)
+                    eligible = tok_valid & (~torch.zeros_like(tok_valid).scatter(1, top_fill_toks, do_fill))
+
+                f3 = do_fill.unsqueeze(-1)
+                e_hd = empty_slots.unsqueeze(-1).expand(-1, -1, hd)
+                t_hd = top_fill_toks.unsqueeze(-1).expand(-1, -1, hd)
+                ak = ak.scatter(1, e_hd, torch.where(f3, torch.gather(kr_f, 1, t_hd), torch.gather(ak, 1, e_hd)))
+                av = av.scatter(1, e_hd, torch.where(f3, torch.gather(v_f, 1, t_hd), torch.gather(av, 1, e_hd)))
+                pm = pm.scatter(1, empty_slots, torch.where(do_fill, torch.gather(p_f, 1, top_fill_toks), torch.gather(pm, 1, empty_slots)))
+                mass = mass.scatter(1, empty_slots, torch.where(do_fill, torch.ones_like(top_fill_vals), torch.gather(mass, 1, empty_slots)))
+                util = util.scatter(1, empty_slots, torch.where(do_fill, torch.gather(init_u, 1, top_fill_toks), torch.gather(util, 1, empty_slots)))
+                act = act.scatter(1, empty_slots, torch.where(do_fill, torch.ones_like(do_fill), torch.gather(act, 1, empty_slots)))
+
+                if not bool(eligible.any()):
+                    return ak, av, mass, util, pm, act, m_res, int(act.sum(dim=-1).min().item())
+                has_any_act, rel_err, best_sim_k, best_slot, sim_v, score_j, init_u = _score_masked(ak, av, mass, act)
+
+            merge_mask = eligible & has_any_act & (best_sim_k >= self.sim_k) & (sim_v >= self.sim_v)
 
             m_oh = F.one_hot(best_slot, num_classes=self.S).float() * merge_mask.float().unsqueeze(-1)
             slot_cnt = m_oh.sum(dim=1)
@@ -190,7 +226,7 @@ class Bolt3Attn(nn.Module):
             )
             mass = torch.where(hit, new_m, mass)
 
-            ev_mask = tok_valid & (~merge_mask)
+            ev_mask = eligible & (~merge_mask)
             with torch.no_grad():
                 ak_n2 = F.normalize(ak.float(), dim=-1)
                 pair_cos = torch.bmm(ak_n2, ak_n2.transpose(-1, -2))
@@ -233,8 +269,9 @@ class Bolt3Attn(nn.Module):
             beta_safe = (w_ev / gersh).unsqueeze(-1)
             v_pred = torch.bmm(k_ev, m_res)
             err_v = (v_f.float() - v_pred) * beta_safe
+            row_has_rem = eligible.any(dim=-1)
             gam_bh = gam.repeat(b).view(bh, 1, 1)
-            gam_eff = torch.where(row_has_valid.view(bh, 1, 1), gam_bh, torch.ones_like(gam_bh))
+            gam_eff = torch.where(row_has_rem.view(bh, 1, 1), gam_bh, torch.ones_like(gam_bh))
             m_res = gam_eff * m_res + torch.bmm(k_ev.transpose(1, 2), err_v)
             return ak, av, mass, util, pm, act, m_res, int(act.sum(dim=-1).min().item())
 
@@ -487,6 +524,168 @@ class Bolt3Attn(nn.Module):
         return self.o_proj(y_out.transpose(1, 2).reshape(b, T, self.H * self.HD))
 
 
+def _steady_block_fast(
+    ly: Bolt3Attn,
+    norm1,
+    norm2,
+    mlp,
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    pos_n: torch.Tensor,
+    slot_buf_t: torch.Tensor,
+    slot_cur_t: torch.Tensor,
+    zero_mask: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_v: torch.Tensor,
+    mask_buf: torch.Tensor,
+    util_acc: torch.Tensor,
+    cur_kr: torch.Tensor,
+    cur_pos: torch.Tensor,
+    cur_b: torch.Tensor,
+    m_res: torch.Tensor,
+    res_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Zero-cat single-token decode step across unified `[sink | ak_eff | half0 | half1]` buffers."""
+    b = x.shape[0]
+    h = norm1(x)
+    q_r, k_r, v_n = ly.head_qkv(h)
+    rot_dim = cos.shape[-1]
+    q_p = apply_rope_cos_sin(q_r, cos, sin, rot_dim)
+    k_p = apply_rope_cos_sin(k_r, cos, sin, rot_dim)
+    beta_n = torch.sigmoid(ly.beta_proj(h)).transpose(1, 2)
+    eta_n = torch.tanh(ly.eta_proj(h)).transpose(1, 2).unsqueeze(-1)
+
+    buf_k.index_copy_(2, slot_buf_t, k_p)
+    buf_v.index_copy_(2, slot_buf_t, v_n)
+    mask_buf.index_copy_(3, slot_buf_t, zero_mask)
+    cur_kr.index_copy_(2, slot_cur_t, k_r)
+    cur_pos.index_copy_(2, slot_cur_t, pos_n)
+    cur_b.index_copy_(2, slot_cur_t, beta_n)
+
+    qg = q_p.view(b, ly.HKV, ly.G, 1, ly.HD)
+    n_tot = buf_k.shape[2]
+    if x.is_cuda:
+        scores = torch.matmul(qg, buf_k.unsqueeze(2).transpose(-1, -2)).float() * (ly.HD ** -0.5)
+    else:
+        scores = torch.matmul(qg.float(), buf_k.float().unsqueeze(2).transpose(-1, -2)) * (ly.HD ** -0.5)
+    scores = scores + mask_buf.view(b, ly.HKV, 1, 1, n_tot)
+    probs = F.softmax(scores, dim=-1)
+    util_acc.add_(probs[..., ly.n_sinks : ly.n_sinks + ly.S].mean(dim=2).reshape(b * ly.HKV, ly.S))
+    y = torch.matmul(probs.to(buf_v.dtype), buf_v.unsqueeze(2)).reshape(b, ly.H, 1, ly.HD)
+
+    q_rn = F.normalize(q_r.view(b, ly.HKV, ly.G, 1, ly.HD).float(), dim=-1)
+    ym = torch.matmul(q_rn, m_res.unsqueeze(2)) * res_scale
+    ym_n = ly.res_norm(ym.reshape(b, ly.H, 1, ly.HD))
+    y = y + (eta_n * ym_n).to(y.dtype)
+
+    x = x + ly.o_proj(y.transpose(1, 2).reshape(b, 1, ly.H * ly.HD))
+    return x + mlp(norm2(x))
+
+
+class _Bolt3GraphRunner:
+    """CUDA Graph runner for steady-state (`cur_len < C`) single-token Bolt-3 decode."""
+
+    def __init__(self, model, batch_size: int, device: torch.device, dtype: torch.dtype):
+        self.model = model
+        self.batch_size = batch_size
+        self.device = device
+        self.dtype = dtype
+        self.L = len(model.blocks)
+        ly0: Bolt3Attn = model.blocks[0].attn
+        self.C = ly0.C
+        self.N_tot = ly0.n_sinks + ly0.S + 2 * ly0.C
+
+        self.states: list[torch.Tensor] = []
+        self.buf_k: list[torch.Tensor] = []
+        self.buf_v: list[torch.Tensor] = []
+        self.mask_buf: list[torch.Tensor] = []
+        self.util_acc: list[torch.Tensor] = []
+        self.cur_kr: list[torch.Tensor] = []
+        self.cur_pos: list[torch.Tensor] = []
+        self.cur_b: list[torch.Tensor] = []
+        self.res_scales: list[torch.Tensor] = []
+
+        for blk in model.blocks:
+            ly: Bolt3Attn = blk.attn
+            n_tot = ly.n_sinks + ly.S + 2 * ly.C
+            self.states.append(torch.zeros(batch_size, ly.HKV, ly.HD, ly.HD, device=device, dtype=torch.float32))
+            self.buf_k.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
+            self.buf_v.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
+            self.mask_buf.append(torch.zeros(batch_size, ly.HKV, 1, n_tot, device=device, dtype=torch.float32))
+            self.util_acc.append(torch.zeros(batch_size * ly.HKV, ly.S, device=device, dtype=torch.float32))
+            self.cur_kr.append(torch.zeros(batch_size, ly.HKV, ly.C, ly.HD, device=device, dtype=dtype))
+            self.cur_pos.append(torch.zeros(batch_size, 1, ly.C, device=device, dtype=torch.float32))
+            self.cur_b.append(torch.zeros(batch_size, ly.HKV, ly.C, device=device, dtype=dtype))
+            self.res_scales.append(((1.0 - ly.gamma_delta()).view(1, ly.HKV, 1, 1, 1) / (ly.HD ** 0.5)).to(device))
+
+        self.g_tok = torch.zeros(batch_size, 1, device=device, dtype=torch.long)
+        self.g_pos = torch.zeros(batch_size, 1, 1, device=device, dtype=torch.float32)
+        self.g_slot_buf = torch.zeros(1, device=device, dtype=torch.long)
+        self.g_slot_cur = torch.zeros(1, device=device, dtype=torch.long)
+        self.g_zero_mask = torch.zeros(batch_size, ly0.HKV, 1, 1, device=device, dtype=torch.float32)
+        self.g_out_h = torch.zeros(batch_size, 1, int(model.config["dim"]), device=device, dtype=dtype)
+        self.slot_idxs = [torch.tensor([i], device=device, dtype=torch.long) for i in range(max(self.N_tot, self.C))]
+        self.inv_freq = ly0.rope.inv_freq.to(device)
+
+        def _forward_steady():
+            with torch.autocast("cuda", torch.bfloat16, enabled=True):
+                x = self.model.embed_tokens(self.g_tok)
+                freqs = self.g_pos.unsqueeze(-1) * self.inv_freq.view(1, 1, 1, -1)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = emb.cos().to(x.dtype)
+                sin = emb.sin().to(x.dtype)
+                for li, blk in enumerate(self.model.blocks):
+                    x = _steady_block_fast(
+                        blk.attn,
+                        blk.norm1,
+                        blk.norm2,
+                        blk.mlp,
+                        x,
+                        cos,
+                        sin,
+                        self.g_pos,
+                        self.g_slot_buf,
+                        self.g_slot_cur,
+                        self.g_zero_mask,
+                        self.buf_k[li],
+                        self.buf_v[li],
+                        self.mask_buf[li],
+                        self.util_acc[li],
+                        self.cur_kr[li],
+                        self.cur_pos[li],
+                        self.cur_b[li],
+                        self.states[li],
+                        self.res_scales[li],
+                    )
+                return self.model.norm(x)
+
+        s = torch.cuda.Stream(device=device)
+        s.wait_stream(torch.cuda.current_stream(device=device))
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                _ = _forward_steady()
+        torch.cuda.current_stream(device=device).wait_stream(s)
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.g_out_h.copy_(_forward_steady())
+
+    @torch.no_grad()
+    def replay(
+        self, tokens: torch.Tensor, pos_start: int, pos_ids: torch.Tensor | None, slot_buf: int, slot_cur: int
+    ) -> torch.Tensor:
+        self.g_tok.copy_(tokens)
+        if pos_ids is None:
+            self.g_pos.fill_(float(pos_start))
+        else:
+            self.g_pos.copy_(pos_ids.view(self.batch_size, 1, 1))
+        self.g_slot_buf.copy_(self.slot_idxs[slot_buf])
+        self.g_slot_cur.copy_(self.slot_idxs[slot_cur])
+        self.graph.replay()
+        return self.g_out_h.clone()
+
+
 class Bolt3Decoder:
     """Constant-memory recurrent chunk/token decoder for Bolt-3 models."""
 
@@ -496,6 +695,18 @@ class Bolt3Decoder:
         self.max_cache_pos = max_cache_pos
         self._diag_eye_cache: dict[torch.device, torch.Tensor] = {}
         self.C = int(model.config.get("bolt3_C", 128))
+        self.use_cuda_graph = bool(kwargs.get("use_cuda_graph", True))
+        self._graph_runners: dict[tuple, _Bolt3GraphRunner] = {}
+        self._gam_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._slot_t_cache: dict[tuple, list[torch.Tensor]] = {}
+        self._zero_m_cache: dict[tuple, torch.Tensor] = {}
+        self._all_bolt3 = all(isinstance(blk.attn, Bolt3Attn) for blk in model.blocks)
+        inv0 = model.blocks[0].attn.rope.inv_freq
+        self._shared_rope = self._all_bolt3 and all(
+            blk.attn.rope.rotary_dim == model.blocks[0].attn.rope.rotary_dim
+            and torch.equal(blk.attn.rope.inv_freq, inv0)
+            for blk in model.blocks
+        )
 
     @staticmethod
     def state_bytes(model) -> tuple[int, int]:
@@ -551,6 +762,7 @@ class Bolt3Decoder:
                     "prev_b": None,
                     "prev_valid": None,
                     "prev_has_pad": False,
+                    "has_prev": False,
                     "cur_kr": None,
                     "cur_kp": None,
                     "cur_v": None,
@@ -559,6 +771,12 @@ class Bolt3Decoder:
                     "cur_valid": None,
                     "cur_has_pad": False,
                     "cur_len": 0,
+                    "buf_k": None,
+                    "buf_v": None,
+                    "mask_buf": None,
+                    "cur_half": 0,
+                    "_synced_ids": None,
+                    "_runner_id": None,
                 }
             else:
                 kv_caches[li] = StaticKV(batch_size, ly.HKV, max_kv_len, ly.HD, device, dt=dt)
@@ -572,9 +790,9 @@ class Bolt3Decoder:
         for c in kv_caches:
             if isinstance(c, dict):
                 for k in list(c.keys()):
-                    if k in ("n_filled", "cur_len"):
+                    if k in ("n_filled", "cur_len", "cur_half"):
                         c[k] = 0
-                    elif k in ("prev_has_pad", "cur_has_pad"):
+                    elif k in ("prev_has_pad", "cur_has_pad", "has_prev"):
                         c[k] = False
                     else:
                         c[k] = None
@@ -618,6 +836,289 @@ class Bolt3Decoder:
         am = sc["act"].view(b, ly.HKV, 1, ly.S)
         sc["att_bias"] = mb.masked_fill(~am, float("-inf"))
 
+    def _get_gam_scale(self, ly: Bolt3Attn, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        key = id(ly)
+        cached = self._gam_cache.get(key)
+        if cached is None or cached[0].device != device:
+            gam = ly.gamma_delta().to(device)
+            res_scale = (1.0 - gam).view(1, ly.HKV, 1, 1, 1) / (ly.HD ** 0.5)
+            cached = (gam, res_scale)
+            self._gam_cache[key] = cached
+        return cached
+
+    def _get_slot_idx(self, ly: Bolt3Attn, idx: int, device: torch.device) -> torch.Tensor:
+        key = (ly.n_sinks + ly.S + 2 * ly.C, device)
+        arr = self._slot_t_cache.get(key)
+        if arr is None:
+            n_tot = max(key[0], ly.C)
+            arr = [torch.tensor([i], device=device, dtype=torch.long) for i in range(n_tot)]
+            self._slot_t_cache[key] = arr
+        return arr[idx]
+
+    def _get_zero_mask(self, b: int, hkv: int, device: torch.device) -> torch.Tensor:
+        key = (b, hkv, device)
+        zm = self._zero_m_cache.get(key)
+        if zm is None:
+            zm = torch.zeros(b, hkv, 1, 1, device=device, dtype=torch.float32)
+            self._zero_m_cache[key] = zm
+        return zm
+
+    def _sync_unified_bufs(self, sc: dict, ly: Bolt3Attn, b: int, device: torch.device, dt: torch.dtype):
+        sig = (
+            id(sc.get("buf_k")),
+            id(sc.get("sink_k")),
+            id(sc.get("prev_kp")),
+            id(sc.get("ak")),
+            id(sc.get("cur_kp")),
+        )
+        if sc.get("buf_k") is not None and sc.get("_synced_ids") == sig:
+            return
+        w0 = ly.n_sinks + ly.S
+        n_tot = w0 + 2 * ly.C
+        inv_freq = ly.rope.inv_freq.to(device)
+        buf_k = sc.get("buf_k")
+        if buf_k is None or buf_k.shape != (b, ly.HKV, n_tot, ly.HD) or buf_k.dtype != dt or buf_k.device != device:
+            buf_k = torch.zeros(b, ly.HKV, n_tot, ly.HD, device=device, dtype=dt)
+            buf_v = torch.zeros_like(buf_k)
+            mask_buf = torch.full((b, ly.HKV, 1, n_tot), float("-inf"), device=device, dtype=torch.float32)
+        else:
+            buf_v = sc["buf_v"]
+            mask_buf = sc["mask_buf"]
+            mask_buf.fill_(float("-inf"))
+
+        if sc["sink_k"] is not None:
+            ns = sc["sink_k"].shape[2]
+            buf_k[:, :, :ns] = sc["sink_k"].to(device=device, dtype=dt)
+            buf_v[:, :, :ns] = sc["sink_v"].to(device=device, dtype=dt)
+            if sc.get("sink_valid") is not None:
+                sv = sc["sink_valid"].view(b, 1, 1, ns).expand(b, ly.HKV, 1, ns)
+                mask_buf[:, :, :, :ns] = torch.where(sv, 0.0, float("-inf"))
+            else:
+                mask_buf[:, :, :, :ns] = 0.0
+
+        if sc["ak"] is not None:
+            if sc.get("ak_eff") is None or sc.get("att_bias") is None:
+                self._refresh_attractor_cache(sc, ly, b, inv_freq)
+            buf_k[:, :, ly.n_sinks : w0] = sc["ak_eff"].to(device=device, dtype=dt)
+            buf_v[:, :, ly.n_sinks : w0] = sc["av"].view(b, ly.HKV, ly.S, ly.HD).to(device=device, dtype=dt)
+            mask_buf[:, :, :, ly.n_sinks : w0] = sc["att_bias"].view(b, ly.HKV, 1, ly.S)
+
+        if sc.get("util_acc") is None or sc["util_acc"].shape != (b * ly.HKV, ly.S):
+            sc["util_acc"] = torch.zeros(b * ly.HKV, ly.S, device=device, dtype=torch.float32)
+
+        cur_half = int(sc.get("cur_half", 0))
+        prev_half = 1 - cur_half
+        p_lo, c_lo = w0 + prev_half * ly.C, w0 + cur_half * ly.C
+
+        if sc["prev_kp"] is not None:
+            p_len = sc["prev_kp"].shape[2]
+            buf_k[:, :, p_lo : p_lo + p_len] = sc["prev_kp"].to(device=device, dtype=dt)
+            buf_v[:, :, p_lo : p_lo + p_len] = sc["prev_v"].to(device=device, dtype=dt)
+            if sc.get("prev_valid") is not None:
+                pv = sc["prev_valid"].view(b, 1, 1, p_len).expand(b, ly.HKV, 1, p_len)
+                mask_buf[:, :, :, p_lo : p_lo + p_len] = torch.where(pv, 0.0, float("-inf"))
+            else:
+                sc["prev_valid"] = torch.ones(b, 1, p_len, device=device, dtype=torch.bool)
+                mask_buf[:, :, :, p_lo : p_lo + p_len] = 0.0
+            sc["has_prev"] = True
+            sc["prev_kp"] = buf_k[:, :, p_lo : p_lo + ly.C]
+            sc["prev_v"] = buf_v[:, :, p_lo : p_lo + ly.C]
+        else:
+            sc["has_prev"] = False
+
+        cl = int(sc.get("cur_len", 0))
+        if sc.get("cur_kr") is None or sc["cur_kr"].shape != (b, ly.HKV, ly.C, ly.HD):
+            sc["cur_kr"] = torch.empty(b, ly.HKV, ly.C, ly.HD, device=device, dtype=dt)
+            sc["cur_pos"] = torch.zeros(b, 1, ly.C, device=device, dtype=torch.float32)
+            sc["cur_b"] = torch.empty(b, ly.HKV, ly.C, device=device, dtype=dt)
+            sc["cur_valid"] = torch.ones(b, 1, ly.C, device=device, dtype=torch.bool)
+        if cl > 0 and sc["cur_kp"] is not None:
+            buf_k[:, :, c_lo : c_lo + cl] = sc["cur_kp"][:, :, :cl].to(device=device, dtype=dt)
+            buf_v[:, :, c_lo : c_lo + cl] = sc["cur_v"][:, :, :cl].to(device=device, dtype=dt)
+            if sc.get("cur_valid") is not None:
+                cv = sc["cur_valid"][:, :, :cl].view(b, 1, 1, cl).expand(b, ly.HKV, 1, cl)
+                mask_buf[:, :, :, c_lo : c_lo + cl] = torch.where(cv, 0.0, float("-inf"))
+            else:
+                mask_buf[:, :, :, c_lo : c_lo + cl] = 0.0
+        sc["cur_kp"] = buf_k[:, :, c_lo : c_lo + ly.C]
+        sc["cur_v"] = buf_v[:, :, c_lo : c_lo + ly.C]
+        sc["buf_k"], sc["buf_v"], sc["mask_buf"] = buf_k, buf_v, mask_buf
+        sc["_synced_ids"] = (
+            id(buf_k),
+            id(sc.get("sink_k")),
+            id(sc.get("prev_kp")),
+            id(sc.get("ak")),
+            id(sc.get("cur_kp")),
+        )
+
+    def _consolidate_layer(
+        self,
+        li: int,
+        ly: Bolt3Attn,
+        sc: dict,
+        states: list,
+        b: int,
+        device: torch.device,
+        inv_freq: torch.Tensor,
+        gam: torch.Tensor,
+        unified: bool,
+    ):
+        if sc.get("util_acc") is not None and sc["util"] is not None:
+            sc["util"] = torch.maximum(sc["util"], 0.25 * (sc["util_acc"] / float(ly.C)))
+            sc["util_acc"].zero_()
+
+        has_prev = sc.get("has_prev", False) if unified else (sc["prev_kp"] is not None)
+        if has_prev:
+            if unified:
+                prev_half = 1 - int(sc.get("cur_half", 0))
+                p_lo = ly.n_sinks + ly.S + prev_half * ly.C
+                p_kp = sc["buf_k"][:, :, p_lo : p_lo + ly.C]
+                p_v = sc["buf_v"][:, :, p_lo : p_lo + ly.C]
+                p_kr, p_pos, p_b, p_val = sc["prev_kr"], sc["prev_pos"], sc["prev_b"], sc["prev_valid"]
+            else:
+                p_kr, p_kp, p_v, p_pos, p_b, p_val = (
+                    sc["prev_kr"],
+                    sc["prev_kp"],
+                    sc["prev_v"],
+                    sc["prev_pos"],
+                    sc["prev_b"],
+                    sc["prev_valid"],
+                )
+
+            all_valid_prev = bool(p_val.all())
+            if sc["sink_k"] is None and all_valid_prev:
+                ns = min(ly.n_sinks, p_kp.shape[2])
+                sc["sink_k"] = p_kp[:, :, :ns].clone()
+                sc["sink_v"] = p_v[:, :, :ns].clone()
+                sc["sink_valid"] = torch.ones(b, 1, ns, device=device, dtype=torch.bool)
+                sc["sink_filled"] = torch.full((b,), ns, device=device, dtype=torch.long)
+                p_kr, p_kp, p_v, p_pos, p_b = (
+                    p_kr[:, :, ns:],
+                    p_kp[:, :, ns:],
+                    p_v[:, :, ns:],
+                    p_pos[:, :, ns:],
+                    p_b[:, :, ns:],
+                )
+                tok_valid_in = (
+                    torch.ones(b * ly.HKV, p_kp.shape[2], device=device, dtype=torch.bool)
+                    if (sc["act"] is not None and not bool(sc["act"].all()))
+                    else None
+                )
+            elif not all_valid_prev or (sc["sink_filled"] is not None and bool((sc["sink_filled"] < ly.n_sinks).any())):
+                if sc["sink_k"] is None:
+                    ns = min(ly.n_sinks, p_kp.shape[2])
+                    sc["sink_k"] = torch.zeros(b, ly.HKV, ns, ly.HD, device=device, dtype=p_kp.dtype)
+                    sc["sink_v"] = torch.zeros_like(sc["sink_k"])
+                    sc["sink_valid"] = torch.zeros(b, 1, ns, device=device, dtype=torch.bool)
+                    sc["sink_filled"] = torch.zeros(b, device=device, dtype=torch.long)
+                p_val_work = p_val.clone()
+                ns = sc["sink_k"].shape[2]
+                for r in range(b):
+                    sf = int(sc["sink_filled"][r].item())
+                    if sf < ns:
+                        v_idx = torch.nonzero(p_val_work[r, 0], as_tuple=False).view(-1)
+                        take = min(ns - sf, int(v_idx.numel()))
+                        if take > 0:
+                            sel = v_idx[:take]
+                            sc["sink_k"][r, :, sf : sf + take] = p_kp[r, :, sel]
+                            sc["sink_v"][r, :, sf : sf + take] = p_v[r, :, sel]
+                            sc["sink_valid"][r, 0, sf : sf + take] = True
+                            sc["sink_filled"][r] = sf + take
+                            p_val_work[r, 0, sel] = False
+                tok_valid_in = p_val_work.expand(b, ly.HKV, -1).reshape(b * ly.HKV, -1)
+            elif sc["act"] is not None and not bool(sc["act"].all()):
+                tok_valid_in = torch.ones(b * ly.HKV, p_kp.shape[2], device=device, dtype=torch.bool)
+            else:
+                tok_valid_in = None
+
+            eye = self._diag_eye_cache.get(device)
+            if eye is None:
+                eye = torch.eye(ly.S, device=device, dtype=torch.bool).unsqueeze(0)
+                self._diag_eye_cache[device] = eye
+            m_in = states[li].view(b * ly.HKV, ly.HD, ly.HD)
+            sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_out, sc["n_filled"] = (
+                ly._consolidate_functional(
+                    sc["ak"],
+                    sc["av"],
+                    sc["mass"],
+                    sc["util"],
+                    sc["pm"],
+                    sc["act"],
+                    m_in,
+                    p_kr,
+                    p_kp,
+                    p_v,
+                    p_pos,
+                    p_b,
+                    inv_freq,
+                    eye,
+                    gam,
+                    n_filled=sc.get("n_filled", 0),
+                    tok_valid=tok_valid_in,
+                )
+            )
+            states[li].copy_(m_out.view(b, ly.HKV, ly.HD, ly.HD))
+            self._refresh_attractor_cache(sc, ly, b, inv_freq)
+
+            if unified:
+                ns = sc["sink_k"].shape[2]
+                w0 = ly.n_sinks + ly.S
+                sc["buf_k"][:, :, :ns] = sc["sink_k"]
+                sc["buf_v"][:, :, :ns] = sc["sink_v"]
+                if sc.get("sink_valid") is not None:
+                    sv = sc["sink_valid"].view(b, 1, 1, ns).expand(b, ly.HKV, 1, ns)
+                    sc["mask_buf"][:, :, :, :ns] = torch.where(sv, 0.0, float("-inf"))
+                else:
+                    sc["mask_buf"][:, :, :, :ns] = 0.0
+                sc["buf_k"][:, :, ly.n_sinks : w0] = sc["ak_eff"]
+                sc["buf_v"][:, :, ly.n_sinks : w0] = sc["av"].view(b, ly.HKV, ly.S, ly.HD)
+                sc["mask_buf"][:, :, :, ly.n_sinks : w0] = sc["att_bias"].view(b, ly.HKV, 1, ly.S)
+
+        if unified:
+            if sc["prev_kr"] is None or sc["prev_kr"].shape != sc["cur_kr"].shape:
+                sc["prev_kr"] = sc["cur_kr"].clone()
+                sc["prev_pos"] = sc["cur_pos"].clone()
+                sc["prev_b"] = sc["cur_b"].clone()
+                sc["prev_valid"] = sc["cur_valid"].clone()
+            else:
+                sc["prev_kr"].copy_(sc["cur_kr"])
+                sc["prev_pos"].copy_(sc["cur_pos"])
+                sc["prev_b"].copy_(sc["cur_b"])
+                sc["prev_valid"].copy_(sc["cur_valid"])
+            sc["has_prev"] = True
+            prev_half = int(sc.get("cur_half", 0))
+            sc["cur_half"] = 1 - prev_half
+            w0 = ly.n_sinks + ly.S
+            p_lo, c_lo = w0 + prev_half * ly.C, w0 + sc["cur_half"] * ly.C
+            sc["prev_kp"] = sc["buf_k"][:, :, p_lo : p_lo + ly.C]
+            sc["prev_v"] = sc["buf_v"][:, :, p_lo : p_lo + ly.C]
+            sc["cur_kp"] = sc["buf_k"][:, :, c_lo : c_lo + ly.C]
+            sc["cur_v"] = sc["buf_v"][:, :, c_lo : c_lo + ly.C]
+            sc["mask_buf"][:, :, :, c_lo : c_lo + ly.C].fill_(float("-inf"))
+            sc["cur_valid"].fill_(True)
+            sc["prev_has_pad"], sc["cur_has_pad"] = sc.get("cur_has_pad", False), False
+            sc["cur_len"] = 0
+            sc["_synced_ids"] = (
+                id(sc["buf_k"]),
+                id(sc.get("sink_k")),
+                id(sc.get("prev_kp")),
+                id(sc.get("ak")),
+                id(sc.get("cur_kp")),
+            )
+        else:
+            sc["prev_kr"], sc["cur_kr"] = sc["cur_kr"], sc["prev_kr"]
+            sc["prev_kp"], sc["cur_kp"] = sc["cur_kp"], sc["prev_kp"]
+            sc["prev_v"], sc["cur_v"] = sc["cur_v"], sc["prev_v"]
+            sc["prev_pos"], sc["cur_pos"] = sc["cur_pos"], sc["prev_pos"]
+            sc["prev_b"], sc["cur_b"] = sc["cur_b"], sc["prev_b"]
+            sc["prev_valid"], sc["cur_valid"] = sc["cur_valid"], sc["prev_valid"]
+            if sc["cur_valid"] is not None:
+                sc["cur_valid"].fill_(True)
+            sc["prev_has_pad"], sc["cur_has_pad"] = sc.get("cur_has_pad", False), False
+            sc["cur_len"] = 0
+            sc["buf_k"] = None
+            sc["_synced_ids"] = None
+
     def step_block(
         self,
         li: int,
@@ -628,33 +1129,92 @@ class Bolt3Decoder:
         kv_caches,
         pos_ids: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
+        _rope_cs: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Step one Transformer block on a chunk-aligned slice `(B, t_s, D)` where `cur_len + t_s <= C`."""
         b, t_s, _ = x.shape
         device = x.device
-        h = blk.norm1(x)
         ly = blk.attn
         if isinstance(ly, Bolt3Attn):
             sc: dict = kv_caches[li]
             inv_freq = ly.rope.inv_freq.to(device)
+            gam, res_scale = self._get_gam_scale(ly, device)
+
+            # Fast zero-cat unified buffer path for unpadded single-token decode steps
+            if t_s == 1 and valid_mask is None:
+                self._sync_unified_bufs(sc, ly, b, device, x.dtype)
+                if _rope_cs is None:
+                    if pos_ids is None:
+                        cos, sin = ly.rope.cos_sin(pos_start, 1, device, x.dtype)
+                        pos_n = torch.full((b, 1, 1), float(pos_start), device=device, dtype=torch.float32)
+                    else:
+                        cos, sin = ly.rope.cos_sin(pos_start, 1, device, x.dtype, pos_ids=pos_ids)
+                        pos_n = pos_ids.unsqueeze(1).float()
+                else:
+                    cos, sin = _rope_cs
+                    pos_n = (
+                        torch.full((b, 1, 1), float(pos_start), device=device, dtype=torch.float32)
+                        if pos_ids is None
+                        else pos_ids.unsqueeze(1).float()
+                    )
+                len_before = int(sc["cur_len"])
+                slot_buf = ly.n_sinks + ly.S + int(sc["cur_half"]) * ly.C + len_before
+                x = _steady_block_fast(
+                    ly,
+                    blk.norm1,
+                    blk.norm2,
+                    blk.mlp,
+                    x,
+                    cos,
+                    sin,
+                    pos_n,
+                    self._get_slot_idx(ly, slot_buf, device),
+                    self._get_slot_idx(ly, len_before, device),
+                    self._get_zero_mask(b, ly.HKV, device),
+                    sc["buf_k"],
+                    sc["buf_v"],
+                    sc["mask_buf"],
+                    sc["util_acc"],
+                    sc["cur_kr"],
+                    sc["cur_pos"],
+                    sc["cur_b"],
+                    states[li],
+                    res_scale,
+                )
+                new_len = len_before + 1
+                sc["cur_len"] = new_len
+                if new_len >= ly.C:
+                    self._consolidate_layer(li, ly, sc, states, b, device, inv_freq, gam, unified=True)
+                return x
+
+            # Multi-token prefill / valid_mask causal path
+            sc["_synced_ids"] = None
+            sc["buf_k"] = None
+            h = blk.norm1(x)
             q_r, k_r, v_n = ly.head_qkv(h)
             if pos_ids is None:
-                q_p, k_p = ly.rope(q_r, pos_start=pos_start), ly.rope(k_r, pos_start=pos_start)
+                if _rope_cs is not None:
+                    cos, sin = _rope_cs
+                else:
+                    cos, sin = ly.rope.cos_sin(pos_start, t_s, device, q_r.dtype)
                 pos_n = (
                     torch.arange(pos_start, pos_start + t_s, device=device, dtype=torch.float32)
                     .view(1, 1, t_s)
                     .expand(b, 1, t_s)
                 )
             else:
+                if _rope_cs is not None:
+                    cos, sin = _rope_cs
+                else:
+                    cos, sin = ly.rope.cos_sin(pos_start, t_s, device, q_r.dtype, pos_ids=pos_ids)
                 pos_n = pos_ids.unsqueeze(1).float()
-                q_p = apply_rope_pos(q_r, pos_n, inv_freq)
-                k_p = apply_rope_pos(k_r, pos_n, inv_freq)
+            q_p = apply_rope_cos_sin(q_r, cos, sin, ly.rope.rotary_dim)
+            k_p = apply_rope_cos_sin(k_r, cos, sin, ly.rope.rotary_dim)
 
             beta_n = torch.sigmoid(ly.beta_proj(h)).transpose(1, 2)
             if valid_mask is not None:
                 beta_n = beta_n * valid_mask.unsqueeze(1).to(beta_n.dtype)
             eta_n = torch.tanh(ly.eta_proj(h)).transpose(1, 2).unsqueeze(-1)
-            gam = ly.gamma_delta()
             scale = ly.HD ** -0.5
 
             if sc["cur_kr"] is None:
@@ -665,6 +1225,9 @@ class Bolt3Decoder:
                 sc["cur_b"] = torch.empty(b, ly.HKV, ly.C, device=device, dtype=beta_n.dtype)
                 sc["cur_valid"] = torch.ones(b, 1, ly.C, device=device, dtype=torch.bool)
                 sc["cur_len"] = 0
+            elif sc["cur_kp"] is None:
+                sc["cur_kp"] = torch.empty(b, ly.HKV, ly.C, ly.HD, device=device, dtype=k_p.dtype)
+                sc["cur_v"] = torch.empty_like(sc["cur_kp"])
 
             len_before = sc["cur_len"]
             new_len = len_before + t_s
@@ -743,106 +1306,16 @@ class Bolt3Decoder:
 
             if states[li] is not None:
                 q_rn = F.normalize(q_r.view(b, ly.HKV, ly.G, t_s, ly.HD).float(), dim=-1)
-                ym = torch.einsum("bhgtc,bhcd->bhgtd", q_rn, states[li]) * (
-                    (1.0 - gam).view(1, ly.HKV, 1, 1, 1) / (ly.HD ** 0.5)
-                )
+                ym = torch.matmul(q_rn, states[li].unsqueeze(2)) * res_scale
                 ym_n = ly.res_norm(ym.reshape(b, ly.H, t_s, ly.HD))
                 y = y + (eta_n * ym_n).to(y.dtype)
 
             x = x + ly.o_proj(y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD))
 
             if new_len >= ly.C:
-                if sc.get("util_acc") is not None and sc["util"] is not None:
-                    sc["util"] = torch.maximum(sc["util"], 0.25 * (sc["util_acc"] / float(ly.C)))
-                    sc["util_acc"].zero_()
-                if sc["prev_kp"] is not None:
-                    p_kr, p_kp, p_v, p_pos, p_b, p_val = (
-                        sc["prev_kr"],
-                        sc["prev_kp"],
-                        sc["prev_v"],
-                        sc["prev_pos"],
-                        sc["prev_b"],
-                        sc["prev_valid"],
-                    )
-                    all_valid_prev = bool(p_val.all())
-                    if sc["sink_k"] is None and all_valid_prev:
-                        ns = min(ly.n_sinks, p_kp.shape[2])
-                        sc["sink_k"] = p_kp[:, :, :ns].clone()
-                        sc["sink_v"] = p_v[:, :, :ns].clone()
-                        sc["sink_valid"] = torch.ones(b, 1, ns, device=device, dtype=torch.bool)
-                        sc["sink_filled"] = torch.full((b,), ns, device=device, dtype=torch.long)
-                        p_kr, p_kp, p_v, p_pos, p_b = (
-                            p_kr[:, :, ns:],
-                            p_kp[:, :, ns:],
-                            p_v[:, :, ns:],
-                            p_pos[:, :, ns:],
-                            p_b[:, :, ns:],
-                        )
-                        tok_valid_in = None
-                    elif not all_valid_prev or (sc["sink_filled"] is not None and bool((sc["sink_filled"] < ly.n_sinks).any())):
-                        if sc["sink_k"] is None:
-                            ns = min(ly.n_sinks, p_kp.shape[2])
-                            sc["sink_k"] = torch.zeros(b, ly.HKV, ns, ly.HD, device=device, dtype=p_kp.dtype)
-                            sc["sink_v"] = torch.zeros_like(sc["sink_k"])
-                            sc["sink_valid"] = torch.zeros(b, 1, ns, device=device, dtype=torch.bool)
-                            sc["sink_filled"] = torch.zeros(b, device=device, dtype=torch.long)
-                        p_val_work = p_val.clone()
-                        ns = sc["sink_k"].shape[2]
-                        for r in range(b):
-                            sf = int(sc["sink_filled"][r].item())
-                            if sf < ns:
-                                v_idx = torch.nonzero(p_val_work[r, 0], as_tuple=False).view(-1)
-                                take = min(ns - sf, int(v_idx.numel()))
-                                if take > 0:
-                                    sel = v_idx[:take]
-                                    sc["sink_k"][r, :, sf : sf + take] = p_kp[r, :, sel]
-                                    sc["sink_v"][r, :, sf : sf + take] = p_v[r, :, sel]
-                                    sc["sink_valid"][r, 0, sf : sf + take] = True
-                                    sc["sink_filled"][r] = sf + take
-                                    p_val_work[r, 0, sel] = False
-                        tok_valid_in = p_val_work.expand(b, ly.HKV, -1).reshape(b * ly.HKV, -1)
-                    else:
-                        tok_valid_in = None
-
-                    eye = self._diag_eye_cache.get(device)
-                    if eye is None:
-                        eye = torch.eye(ly.S, device=device, dtype=torch.bool).unsqueeze(0)
-                        self._diag_eye_cache[device] = eye
-                    m_in = states[li].view(b * ly.HKV, ly.HD, ly.HD)
-                    sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_out, sc["n_filled"] = (
-                        ly._consolidate_functional(
-                            sc["ak"],
-                            sc["av"],
-                            sc["mass"],
-                            sc["util"],
-                            sc["pm"],
-                            sc["act"],
-                            m_in,
-                            p_kr,
-                            p_kp,
-                            p_v,
-                            p_pos,
-                            p_b,
-                            inv_freq,
-                            eye,
-                            gam,
-                            n_filled=sc.get("n_filled", 0),
-                            tok_valid=tok_valid_in,
-                        )
-                    )
-                    states[li] = m_out.view(b, ly.HKV, ly.HD, ly.HD)
-                    self._refresh_attractor_cache(sc, ly, b, inv_freq)
-
-                # Swap prev and cur preallocated buffers (zero tensor allocation)
-                sc["prev_kr"], sc["cur_kr"] = sc["cur_kr"], sc["prev_kr"]
-                sc["prev_kp"], sc["cur_kp"] = sc["cur_kp"], sc["prev_kp"]
-                sc["prev_v"], sc["cur_v"] = sc["cur_v"], sc["prev_v"]
-                sc["prev_pos"], sc["cur_pos"] = sc["cur_pos"], sc["prev_pos"]
-                sc["prev_b"], sc["cur_b"] = sc["cur_b"], sc["prev_b"]
-                sc["prev_valid"], sc["cur_valid"] = sc["cur_valid"], sc["prev_valid"]
-                sc["prev_has_pad"], sc["cur_has_pad"] = sc.get("cur_has_pad", False), False
-                sc["cur_len"] = 0
+                self._consolidate_layer(li, ly, sc, states, b, device, inv_freq, gam, unified=False)
         else:
+            h = blk.norm1(x)
             q, k, v = ly.head_qkv(h)
             q, k = ly.rope(q, pos_start=pos_start), ly.rope(k, pos_start=pos_start)
             n_prev = kv_caches[li].n
@@ -870,6 +1343,102 @@ class Bolt3Decoder:
 
         return x + blk.mlp(blk.norm2(x))
 
+    def _can_use_graph(self, tokens: torch.Tensor, valid_mask, kv_caches) -> bool:
+        if not (tokens.is_cuda and tokens.shape[1] == 1 and valid_mask is None and self.use_cuda_graph):
+            return False
+        if not (self._all_bolt3 and self._shared_rope and len(kv_caches) == len(self.model.blocks)):
+            return False
+        b = tokens.shape[0]
+        if b == 1:
+            return True
+        if b > 64:
+            return False
+        key = (b, str(tokens.device))
+        if key in self._graph_runners:
+            return True
+        try:
+            free_b, _ = torch.cuda.mem_get_info(tokens.device)
+            return free_b >= (b * 128 + 2048) * 1024 * 1024
+        except Exception:
+            return False
+
+    def _get_graph_runner(self, b: int, device: torch.device, dtype: torch.dtype) -> _Bolt3GraphRunner:
+        key = (b, str(device))
+        runner = self._graph_runners.get(key)
+        if runner is None:
+            for k_old in [k for k in list(self._graph_runners.keys()) if k[0] != 1 and k != key]:
+                del self._graph_runners[k_old]
+            runner = _Bolt3GraphRunner(self.model, b, device, dtype)
+            self._graph_runners[key] = runner
+        return runner
+
+    @staticmethod
+    def _bind_graph_state(
+        dec,
+        runner: _Bolt3GraphRunner,
+        states: list,
+        kv_caches: list[dict],
+        b: int,
+        device: torch.device,
+        dt: torch.dtype,
+    ):
+        rid = id(runner)
+        for li, blk in enumerate(dec.model.blocks):
+            sc = kv_caches[li]
+            ly: Bolt3Attn = blk.attn
+            expected_sig = (
+                rid,
+                id(states[li]),
+                id(sc.get("buf_k")),
+                id(sc.get("sink_k")),
+                id(sc.get("ak")),
+                id(sc.get("prev_kp")),
+            )
+            if sc.get("_runner_id") == expected_sig:
+                continue
+            dec._sync_unified_bufs(sc, ly, b, device, dt)
+            runner.states[li].copy_(states[li])
+            runner.buf_k[li].copy_(sc["buf_k"])
+            runner.buf_v[li].copy_(sc["buf_v"])
+            runner.mask_buf[li].copy_(sc["mask_buf"])
+            runner.util_acc[li].copy_(sc["util_acc"])
+            runner.cur_kr[li].copy_(sc["cur_kr"])
+            runner.cur_pos[li].copy_(sc["cur_pos"])
+            runner.cur_b[li].copy_(sc["cur_b"])
+
+            states[li] = runner.states[li]
+            sc["buf_k"] = runner.buf_k[li]
+            sc["buf_v"] = runner.buf_v[li]
+            sc["mask_buf"] = runner.mask_buf[li]
+            sc["util_acc"] = runner.util_acc[li]
+            sc["cur_kr"] = runner.cur_kr[li]
+            sc["cur_pos"] = runner.cur_pos[li]
+            sc["cur_b"] = runner.cur_b[li]
+            w0 = ly.n_sinks + ly.S
+            cur_half = int(sc.get("cur_half", 0))
+            p_lo = w0 + (1 - cur_half) * ly.C
+            c_lo = w0 + cur_half * ly.C
+            if sc.get("has_prev", False):
+                sc["prev_kp"] = sc["buf_k"][:, :, p_lo : p_lo + ly.C]
+                sc["prev_v"] = sc["buf_v"][:, :, p_lo : p_lo + ly.C]
+            sc["cur_kp"] = sc["buf_k"][:, :, c_lo : c_lo + ly.C]
+            sc["cur_v"] = sc["buf_v"][:, :, c_lo : c_lo + ly.C]
+            sc["_synced_ids"] = (
+                id(sc["buf_k"]),
+                id(sc.get("sink_k")),
+                id(sc.get("prev_kp")),
+                id(sc.get("ak")),
+                id(sc.get("cur_kp")),
+            )
+            sc["_runner_id"] = (
+                rid,
+                id(states[li]),
+                id(sc["buf_k"]),
+                id(sc.get("sink_k")),
+                id(sc.get("ak")),
+                id(sc.get("prev_kp")),
+            )
+
     @torch.no_grad()
     def step(
         self,
@@ -883,11 +1452,36 @@ class Bolt3Decoder:
         m = self.model
         t_tot = tokens.shape[1]
         if t_tot == 1:
+            b = tokens.shape[0]
+            dt = torch.bfloat16 if tokens.is_cuda else torch.float32
+            if self._can_use_graph(tokens, valid_mask, kv_caches):
+                len0 = int(kv_caches[0].get("cur_len", 0))
+                half0 = int(kv_caches[0].get("cur_half", 0))
+                if all(c.get("cur_len", 0) == len0 and c.get("cur_half", 0) == half0 for c in kv_caches):
+                    runner = self._get_graph_runner(b, tokens.device, dt)
+                    self._bind_graph_state(self, runner, states, kv_caches, b, tokens.device, dt)
+                    ly0: Bolt3Attn = m.blocks[0].attn
+                    slot_buf = ly0.n_sinks + ly0.S + half0 * ly0.C + len0
+                    out_h = runner.replay(tokens, pos_start, pos_ids, slot_buf, len0)
+                    new_len = len0 + 1
+                    for sc in kv_caches:
+                        sc["cur_len"] = new_len
+                    if new_len >= ly0.C:
+                        inv_freq = ly0.rope.inv_freq.to(tokens.device)
+                        for li, blk in enumerate(m.blocks):
+                            ly = blk.attn
+                            gam, _ = self._get_gam_scale(ly, tokens.device)
+                            self._consolidate_layer(li, ly, kv_caches[li], states, b, tokens.device, inv_freq, gam, unified=True)
+                    return out_h, states, kv_caches
+
             with torch.autocast("cuda", torch.bfloat16, enabled=tokens.is_cuda):
                 x = m.embed_tokens(tokens)
+                rope_cs = None
+                if self._shared_rope:
+                    rope_cs = m.blocks[0].attn.rope.cos_sin(pos_start, 1, tokens.device, x.dtype, pos_ids=pos_ids)
                 for li, blk in enumerate(m.blocks):
                     x = self.step_block(
-                        li, blk, x, pos_start, states, kv_caches, pos_ids=pos_ids, valid_mask=valid_mask
+                        li, blk, x, pos_start, states, kv_caches, pos_ids=pos_ids, valid_mask=valid_mask, _rope_cs=rope_cs
                     )
                 return m.norm(x), states, kv_caches
 
@@ -905,9 +1499,12 @@ class Bolt3Decoder:
             v_slice = valid_mask[:, s : s + take] if valid_mask is not None else None
             with torch.autocast("cuda", torch.bfloat16, enabled=tokens.is_cuda):
                 x = m.embed_tokens(tokens[:, s : s + take])
+                rope_cs = None
+                if self._shared_rope:
+                    rope_cs = m.blocks[0].attn.rope.cos_sin(pos, take, tokens.device, x.dtype, pos_ids=p_slice)
                 for li, blk in enumerate(m.blocks):
                     x = self.step_block(
-                        li, blk, x, pos, states, kv_caches, pos_ids=p_slice, valid_mask=v_slice
+                        li, blk, x, pos, states, kv_caches, pos_ids=p_slice, valid_mask=v_slice, _rope_cs=rope_cs
                     )
                 outs.append(m.norm(x))
             s += take

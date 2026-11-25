@@ -949,6 +949,8 @@ def run_benchmark_suite(
     seed_teacher: dict | None = None,
     batch_size: int | None = None,
     tasks: tuple[str, ...] = (),
+    fresh_student: bool = False,
+    fresh: bool = False,
 ) -> dict:
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -966,9 +968,13 @@ def run_benchmark_suite(
     print(f"Inspect AI Active: {HAS_INSPECT}")
     print("=" * 88, flush=True)
 
-    if os.path.isfile(json_path):
+    if os.path.isfile(json_path) and not fresh:
         with open(json_path) as f:
             results = json.load(f)
+        if fresh_student:
+            results["student"] = {}
+            results["mcnemar"] = {}
+            results["systems"] = {}
     else:
         results = {
             "harness": "UK AISI Inspect (inspect_ai)" if HAS_INSPECT else "native",
