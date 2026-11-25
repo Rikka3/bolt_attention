@@ -920,11 +920,8 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
             runs_d = []
             with torch.autocast("cuda", torch.bfloat16):
                 for _ in range(3):
-                    if hasattr(cache_hf, "crop"):
-                        cache_hf.crop(T_c)
-                    else:
-                        del cache_hf
-                        cache_hf = _make_donor_cache(T_c)
+                    del cache_hf
+                    cache_hf = _make_donor_cache(T_c)
                     torch.cuda.synchronize()
                     t0 = time.perf_counter()
                     for _ in range(gen_steps):
