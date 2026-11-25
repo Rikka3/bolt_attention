@@ -7,7 +7,7 @@ import statistics
 import torch
 import torch.nn.functional as F
 
-from .attention import Bolt3Decoder
+from .attention import Bolt3Attn, Bolt3Decoder
 from .benchmark import _load_hf_donor, _load_rows, _load_student, gsm8k_prompt
 from .profiles import resolve_profile
 from .server import get_all_eos_ids
@@ -191,7 +191,7 @@ def layer_parity(stu, tok, device, T: int = 1024) -> list[dict]:
         ref_d = (outs[li] - ins[li]).float()
         rec_d = (rec - ins[li]).float()
         err = ((rec_d - ref_d).norm(dim=-1) / ref_d.norm(dim=-1).clamp_min(1e-6))[0]
-        row = {"layer": li, "type": "bolt3"}
+        row = {"layer": li, "type": "bolt3" if isinstance(blk.attn, Bolt3Attn) else "gdn"}
         for lo, hi in zip(edges[:-1], edges[1:]):
             row[f"{lo}-{hi}"] = round(float(err[lo:hi].mean()), 4)
         rows.append(row)

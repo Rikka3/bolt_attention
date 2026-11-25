@@ -102,8 +102,11 @@ def convert_donor_model(
         f"HKV={cfg['num_kv_heads']}, HD={cfg['head_dim']}, L={L})"
     )
     cold_tag = f" | cold_layers={resolved_cold} (max_blks={max_cold_blocks}, topk={cold_topk})" if resolved_cold else ""
+    n_b3 = sum(1 for lt in cfg["layer_types"] if lt == "bolt3")
+    n_lin = sum(1 for lt in cfg["layer_types"] if lt == "linear_attention")
+    layout_str = f"{n_b3}/{L} Bolt3Attn + {n_lin}/{L} GatedDeltaNet" if n_lin else f"{n_b3}/{L} Bolt3Attn layers"
     print(
-        f"  Bolt-3 layout : {L}/{L} Bolt3Attn layers (0 pure softmax) | "
+        f"  Bolt-3 layout : {layout_str} (0 pure softmax) | "
         f"S={bolt3_S}, C={bolt3_C}, max_T={max_T}, freeze_proj={freeze_proj}{cold_tag}"
     )
 
@@ -333,13 +336,19 @@ def _build_reasoning_and_eval_caches(
 
 def _load_donor_teacher(donor_dir: str, stu_cfg: dict, device: torch.device):
     hf_sd = load_all_safetensors(donor_dir)
-    rep_cfg = dict(stu_cfg, layer_types=["softmax"] * int(stu_cfg["num_layers"]))
+    rep_cfg = dict(
+        stu_cfg,
+        layer_types=["softmax" if lt in ("bolt3", "vsa") else lt for lt in stu_cfg["layer_types"]],
+    )
     donor = Bolt3LM(**rep_cfg)
     donor.load_state_dict(map_hf_to_bolt3(hf_sd, rep_cfg, target_attn="softmax"), strict=True)
     del hf_sd
-    donor = donor.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32).eval()
-    for p in donor.parameters():
+    donor = donor.to(device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32)
+    for n_, p in donor.named_parameters():
+        if any(k in n_ for k in FP32_KEYS):
+            p.data = p.data.to(device, dtype=torch.float32)
         p.requires_grad_(False)
+    donor.eval()
     return donor, False
 
 
@@ -487,6 +496,7 @@ def _stage1_attention_transfer(
         total_loss = torch.zeros((), device=device, dtype=torch.float32)
 
         if on_policy_from is not None and s >= on_policy_from:
+            bolt3_set = set(bolt3_indices)
             with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
                 with torch.no_grad():
                     xs = stu.embed_tokens(x)
@@ -494,14 +504,18 @@ def _stage1_attention_transfer(
                     with torch.no_grad():
                         h_n = blk.norm1(xs)
                         a_tgt = donor.blocks[li].attn(h_n)
-                    a_hat = blk.attn(h_n)
-                    loss_li = _attn_transfer_loss(a_hat, a_tgt) / len(bolt3_indices)
-                    loss_li.backward()
-                    total_loss = total_loss + loss_li.detach()
-                    with torch.no_grad():
+                    if li in bolt3_set:
+                        a_hat = blk.attn(h_n)
+                        loss_li = _attn_transfer_loss(a_hat, a_tgt) / len(bolt3_indices)
+                        loss_li.backward()
+                        total_loss = total_loss + loss_li.detach()
                         xs = xs + a_hat.detach()
+                        del a_hat, loss_li
+                    else:
+                        xs = xs + a_tgt
+                    with torch.no_grad():
                         xs = xs + blk.mlp(blk.norm2(xs))
-                    del a_hat, a_tgt, loss_li
+                    del a_tgt
             del xs
         else:
             norm_inputs, attn_targets = {}, {}
@@ -541,12 +555,15 @@ def _setup_trainable(
 ):
     bolt3_core, bolt3_proj, mlp_and_norm = [], [], []
     freeze_proj = bool(stu_cfg.get("bolt3_freeze_proj", True)) and not train_proj
+    b3_layers = {f"blocks.{li}." for li, blk in enumerate(stu.blocks) if isinstance(blk.attn, Bolt3Attn)}
+    bolt3_core_keys = ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm")
 
     for n_, p_ in stu.named_parameters():
-        if any(k in n_ for k in FP32_KEYS):
+        in_b3 = any(n_.startswith(pfx) for pfx in b3_layers)
+        if in_b3 and any(k in n_ for k in bolt3_core_keys):
             p_.requires_grad_(True)
             bolt3_core.append(p_)
-        elif ".attn." in n_ and not freeze_proj:
+        elif in_b3 and ".attn." in n_ and not freeze_proj:
             p_.requires_grad_(True)
             bolt3_proj.append(p_)
         elif not freeze_mlp and (".mlp." in n_ or ".norm1." in n_ or ".norm2." in n_):
@@ -555,10 +572,11 @@ def _setup_trainable(
         else:
             p_.requires_grad_(False)
 
-    for p_ in stu.parameters():
+    for n_, p_ in stu.named_parameters():
+        keep_fp32 = p_.requires_grad or any(k in n_ for k in FP32_KEYS)
         p_.data = p_.data.to(
             device,
-            dtype=(torch.float32 if p_.requires_grad else (torch.bfloat16 if device.type == "cuda" else torch.float32)),
+            dtype=(torch.float32 if keep_fp32 else (torch.bfloat16 if device.type == "cuda" else torch.float32)),
         )
     for b in stu.buffers():
         b.data = b.data.to(device)
@@ -1241,7 +1259,16 @@ def scan_checkpoint(ckpt_path: str) -> dict:
     out = {}
     for li in range(num_layers):
         lg_key = f"blocks.{li}.{prefix_attn}.log_gamma"
+        alog_key = f"blocks.{li}.{prefix_attn}.A_log"
         if lg_key not in sd:
+            if alog_key in sd:
+                a_exp = sd[alog_key].float().exp()
+                dtb = sd[f"blocks.{li}.{prefix_attn}.dt_bias"].float()
+                print(
+                    f"  L{li:<2d} | [gdn] decay_a={float(a_exp.mean()):.3f}..{float(a_exp.max()):.3f} | "
+                    f"dt_bias={float(dtb.mean()):+.3f}"
+                )
+                out[str(li)] = {"type": "linear_attention", "a_exp_mean": float(a_exp.mean())}
             continue
         lg = sd[lg_key].float()
         gam = (0.999 * torch.sigmoid(lg)).clamp(1e-3, 0.999)

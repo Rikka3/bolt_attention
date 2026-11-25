@@ -40,6 +40,8 @@ def load_all_safetensors(donor_dir: str) -> dict[str, torch.Tensor]:
         for k, v in load_file(sh).items():
             if k.startswith("visual.") or k.startswith("model.visual.") or ".visual." in k:
                 continue
+            if k.startswith("mtp.") or ".mtp." in k:
+                continue
             if k.startswith("model.language_model."):
                 k = "model." + k[len("model.language_model.") :]
             elif k.startswith("language_model.model."):
@@ -90,12 +92,20 @@ def inspect_donor_config(
 
     has_qkv_bias = any(k.endswith("self_attn.q_proj.bias") for k in hf_sd)
     has_qk_norm = any(k.endswith("self_attn.q_norm.weight") for k in hf_sd)
-    packed_q_gate = any(
+    packed_q_gate = bool(hc.get("attn_output_gate", False)) or any(
         k.endswith("self_attn.q_proj.weight") and t.shape[0] == 2 * num_heads * head_dim
         for k, t in hf_sd.items()
     )
+    raw_lts = hc.get("layer_types")
+    if raw_lts and "linear_attention" in raw_lts:
+        layer_types = ["linear_attention" if lt == "linear_attention" else "bolt3" for lt in raw_lts]
+    else:
+        layer_types = ["bolt3"] * num_layers
 
-    return dict(
+    mtype = str(hc.get("model_type") or raw_cfg.get("model_type") or "").lower()
+    rms_norm_offset = 1.0 if mtype in ("qwen3_5", "qwen3_5_text") else 0.0
+
+    cfg_out = dict(
         donor_arch=raw_cfg.get("model_type", hc.get("model_type", "unknown")),
         vocab_size=vocab_size,
         dim=dim,
@@ -109,6 +119,7 @@ def inspect_donor_config(
         partial_rotary_factor=partial_rotary_factor,
         rope_scaling=rope_scaling,
         eps=eps,
+        rms_norm_offset=rms_norm_offset,
         qkv_bias=has_qkv_bias,
         qk_norm=has_qk_norm,
         packed_q_gate=packed_q_gate,
@@ -124,14 +135,24 @@ def inspect_donor_config(
         bolt3_cold_layers=[int(i) for i in (bolt3_cold_layers or ())],
         bolt3_max_cold_blocks=int(bolt3_max_cold_blocks),
         bolt3_cold_topk=int(bolt3_cold_topk),
-        layer_types=["bolt3"] * num_layers,
+        layer_types=layer_types,
     )
+    if "linear_attention" in layer_types:
+        cfg_out.update(
+            linear_conv_kernel_dim=int(hc.get("linear_conv_kernel_dim", 4)),
+            linear_key_head_dim=int(hc.get("linear_key_head_dim", 128)),
+            linear_num_key_heads=int(hc.get("linear_num_key_heads", 16)),
+            linear_value_head_dim=int(hc.get("linear_value_head_dim", 128)),
+            linear_num_value_heads=int(hc.get("linear_num_value_heads", 32)),
+        )
+    return cfg_out
 
 
 def map_hf_to_bolt3(hf_sd: dict[str, torch.Tensor], cfg: dict, target_attn: str = "bolt3") -> dict[str, torch.Tensor]:
     """Map HF Transformer safetensors into Bolt3LM (`target_attn='bolt3'` or `'softmax'` for teacher)."""
     sd: dict[str, torch.Tensor] = {}
     H, HD, D = int(cfg["num_heads"]), int(cfg["head_dim"]), int(cfg["dim"])
+    keep_gate = bool(cfg.get("packed_q_gate", False))
 
     for k, t in hf_sd.items():
         if k == "model.embed_tokens.weight":
@@ -146,7 +167,7 @@ def map_hf_to_bolt3(hf_sd: dict[str, torch.Tensor], cfg: dict, target_attn: str 
             if sub.startswith("self_attn."):
                 proj = sub.split(".", 1)[1]
                 w = t.detach().cpu().clone()
-                if proj == "q_proj.weight" and w.shape[0] == 2 * H * HD and target_attn == "bolt3":
+                if proj == "q_proj.weight" and w.shape[0] == 2 * H * HD and target_attn == "bolt3" and not keep_gate:
                     q_part, _ = torch.chunk(w.view(H, 2, HD, D), 2, dim=1)
                     sd[f"blocks.{li}.attn.q_proj.weight"] = q_part.reshape(H * HD, D).clone()
                 elif proj in (
@@ -161,6 +182,20 @@ def map_hf_to_bolt3(hf_sd: dict[str, torch.Tensor], cfg: dict, target_attn: str 
                     "k_norm.weight",
                 ):
                     sd[f"blocks.{li}.attn.{proj}"] = w
+            elif sub.startswith("linear_attn."):
+                sub_name = sub.split(".", 1)[1]
+                if sub_name in (
+                    "A_log",
+                    "conv1d.weight",
+                    "dt_bias",
+                    "in_proj_a.weight",
+                    "in_proj_b.weight",
+                    "in_proj_qkv.weight",
+                    "in_proj_z.weight",
+                    "norm.weight",
+                    "out_proj.weight",
+                ):
+                    sd[f"blocks.{li}.attn.{sub_name}"] = t.detach().cpu().clone()
             elif sub == "input_layernorm.weight":
                 sd[f"blocks.{li}.norm1.weight"] = t.detach().cpu().clone()
             elif sub == "post_attention_layernorm.weight":

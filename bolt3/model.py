@@ -5,26 +5,21 @@ import gc
 import os
 
 import torch
-import gc
-import os
-
 import torch.nn as nn
-import gc
-import os
-
 import torch.utils.checkpoint
 
 from .attention import Bolt3Attn
-from .nn import RMSNorm, SoftmaxAttn, SwiGLUMLP
+from .nn import GatedDeltaNet, RMSNorm, SoftmaxAttn, SwiGLUMLP
 
 # Parameters always maintained in fp32 (checkpoints, healing master weights, and inference)
-FP32_KEYS = ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm")
+FP32_KEYS = ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm", "A_log", "dt_bias")
 
 
 class Bolt3Block(nn.Module):
     def __init__(self, cfg: dict, layer_type: str = "bolt3", layer_idx: int = 0):
         super().__init__()
-        self.norm1 = RMSNorm(int(cfg["dim"]), float(cfg["eps"]))
+        norm_off = float(cfg.get("rms_norm_offset", 0.0))
+        self.norm1 = RMSNorm(int(cfg["dim"]), float(cfg["eps"]), weight_offset=norm_off)
         if layer_type in ("bolt3", "vsa"):
             self.attn = Bolt3Attn(
                 cfg,
@@ -33,9 +28,11 @@ class Bolt3Block(nn.Module):
                 C=int(cfg.get("bolt3_C", 128)),
                 layer_idx=layer_idx,
             )
+        elif layer_type in ("linear_attention", "gated_deltanet"):
+            self.attn = GatedDeltaNet(cfg, layer_idx=layer_idx)
         else:
             self.attn = SoftmaxAttn(cfg)
-        self.norm2 = RMSNorm(int(cfg["dim"]), float(cfg["eps"]))
+        self.norm2 = RMSNorm(int(cfg["dim"]), float(cfg["eps"]), weight_offset=norm_off)
         self.mlp = SwiGLUMLP(cfg)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -91,7 +88,11 @@ class Bolt3LM(nn.Module):
         )
         self.embed_tokens = nn.Embedding(self.config["vocab_size"], self.config["dim"])
         self.blocks = nn.ModuleList([Bolt3Block(self.config, lt, layer_idx=li) for li, lt in enumerate(layer_types)])
-        self.norm = RMSNorm(self.config["dim"], self.config["eps"])
+        self.norm = RMSNorm(
+            self.config["dim"],
+            self.config["eps"],
+            weight_offset=float(self.config.get("rms_norm_offset", 0.0)),
+        )
         self.lm_head = nn.Linear(self.config["dim"], self.config["vocab_size"], bias=False)
         if self.config["tie_word_embeddings"]:
             self.lm_head.weight = self.embed_tokens.weight

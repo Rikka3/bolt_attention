@@ -9,18 +9,37 @@ import torch.nn.functional as F
 
 
 class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, weight_offset: float = 0.0):
+        super().__init__()
+        self.weight_offset = float(weight_offset)
+        self.weight = nn.Parameter(torch.zeros(dim) if self.weight_offset != 0.0 else torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight_offset == 0.0 and x.dtype == self.weight.dtype and hasattr(F, "rms_norm"):
+            return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
+        dt = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        w = (self.weight.float() + self.weight_offset) if self.weight_offset != 0.0 else self.weight.float()
+        return (xf * w).to(dt)
+
+
+class RMSNormGated(nn.Module):
+    """Standard gated RMSNorm (`weight * norm(x) * silu(gate)`), matching Qwen3.5 GatedDeltaNet."""
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype == self.weight.dtype and hasattr(F, "rms_norm"):
-            return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
-        dt = x.dtype
-        xf = x.float()
-        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (xf * self.weight.float()).to(dt)
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        dt = hidden_states.dtype
+        hs = hidden_states.float()
+        hs = hs * torch.rsqrt(hs.pow(2).mean(-1, keepdim=True) + self.eps)
+        hs = self.weight * hs.to(dt)
+        hs = hs * F.silu(gate.float())
+        return hs.to(dt)
 
 
 def inv_freq_for_rope(
@@ -144,8 +163,9 @@ class SoftmaxAttn(nn.Module):
         self.o_proj = nn.Linear(H * HD, D, bias=False)
 
         if cfg.get("qk_norm", False):
-            self.q_norm = RMSNorm(HD, float(cfg["eps"]))
-            self.k_norm = RMSNorm(HD, float(cfg["eps"]))
+            norm_off = float(cfg.get("rms_norm_offset", 0.0))
+            self.q_norm = RMSNorm(HD, float(cfg["eps"]), weight_offset=norm_off)
+            self.k_norm = RMSNorm(HD, float(cfg["eps"]), weight_offset=norm_off)
         else:
             self.q_norm, self.k_norm = None, None
 
@@ -161,41 +181,231 @@ class SoftmaxAttn(nn.Module):
             float(cfg.get("partial_rotary_factor", 1.0)),
         )
 
-    def head_qkv(self, x: torch.Tensor):
-        B, T, _ = x.shape
-        if self.packed_q_gate:
-            q, _ = torch.chunk(self.q_proj(x).view(B, T, self.H, self.HD * 2), 2, dim=-1)
-        else:
-            q = self.q_proj(x).view(B, T, self.H, self.HD)
-        k = self.k_proj(x).view(B, T, self.HKV, self.HD)
-        v = self.v_proj(x).view(B, T, self.HKV, self.HD)
-        if self.q_norm is not None:
-            q, k = self.q_norm(q), self.k_norm(k)
-        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def head_qkv_gate(self, x: torch.Tensor):
         B, T, _ = x.shape
         if self.packed_q_gate:
             q, gate = torch.chunk(self.q_proj(x).view(B, T, self.H, self.HD * 2), 2, dim=-1)
             gate = gate.reshape(B, T, self.H * self.HD)
-            k = self.k_proj(x).view(B, T, self.HKV, self.HD)
-            v = self.v_proj(x).view(B, T, self.HKV, self.HD)
-            if self.q_norm is not None:
-                q, k = self.q_norm(q), self.k_norm(k)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            q, k = self.rope(q), self.rope(k)
-            try:
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=(self.G > 1))
-            except TypeError:
-                y = F.scaled_dot_product_attention(q, repeat_kv(k, self.G), repeat_kv(v, self.G), is_causal=True)
-            return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD) * torch.sigmoid(gate))
+        else:
+            q = self.q_proj(x).view(B, T, self.H, self.HD)
+            gate = None
+        k = self.k_proj(x).view(B, T, self.HKV, self.HD)
+        v = self.v_proj(x).view(B, T, self.HKV, self.HD)
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), gate
 
-        q, k, v = self.head_qkv(x)
+    def head_qkv(self, x: torch.Tensor):
+        q, k, v, _ = self.head_qkv_gate(x)
+        return q, k, v
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        q, k, v, gate = self.head_qkv_gate(x)
         q, k = self.rope(q), self.rope(k)
         try:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=(self.G > 1))
         except TypeError:
             y = F.scaled_dot_product_attention(q, repeat_kv(k, self.G), repeat_kv(v, self.G), is_causal=True)
-        if self.g_proj is not None:
-            y = y * torch.sigmoid(self.g_proj(x).view(B, T, self.H, self.HD).transpose(1, 2))
-        return self.o_proj(y.transpose(1, 2).reshape(B, T, self.H * self.HD))
+        out = y.transpose(1, 2).reshape(B, T, self.H * self.HD)
+        if gate is not None:
+            out = out * torch.sigmoid(gate)
+        elif self.g_proj is not None:
+            out = out * torch.sigmoid(self.g_proj(x))
+        return self.o_proj(out)
+
+
+def _l2norm_last(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+
+
+def _chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Chunked UT-solve GatedDeltaNet recurrence (float32 state, matches Qwen3.5 HF)."""
+    init_dt = query.dtype
+    b, seq_len, _, hk = key.shape
+    nv, hv = value.shape[-2:]
+    query, key, value, beta, decay = [
+        t.transpose(1, 2).to(torch.float32).contiguous() for t in (query, key, value, beta, g)
+    ]
+    query = _l2norm_last(query) * (hk ** -0.5)
+    key = _l2norm_last(key)
+
+    pad_sz = (chunk_size - seq_len % chunk_size) % chunk_size
+    if pad_sz:
+        query, key, value = (F.pad(t, (0, 0, 0, pad_sz)) for t in (query, key, value))
+        beta, decay = (F.pad(t, (0, pad_sz)) for t in (beta, decay))
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, k_beta, v_beta = [
+        t.reshape(b, nv, -1, chunk_size, t.shape[-1]) for t in (query, key, k_beta, v_beta)
+    ]
+    decay = decay.reshape(b, nv, -1, chunk_size)
+    n_chunks = decay.shape[2]
+
+    triu_m = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device).triu(1)
+    cum_dec = decay.cumsum(dim=3)
+    pw_dec = (cum_dec.unsqueeze(4) - cum_dec.unsqueeze(3)).masked_fill(triu_m, float("-inf")).exp()
+
+    ut_sys = (k_beta @ key.transpose(-1, -2)) * pw_dec
+    intra = (query @ key.transpose(-1, -2)) * pw_dec
+    dec_kb = k_beta * cum_dec.exp().unsqueeze(-1)
+
+    new_values = torch.linalg.solve_triangular(ut_sys, v_beta, upper=False, unitriangular=True)
+    k_cumdec = torch.linalg.solve_triangular(ut_sys, dec_kb, upper=False, unitriangular=True)
+
+    rec = (
+        torch.zeros(b, nv, hk, hv, dtype=torch.float32, device=query.device)
+        if initial_state is None
+        else initial_state.to(torch.float32)
+    )
+    out = torch.empty_like(new_values)
+    query = query * cum_dec.exp().unsqueeze(-1)
+    key = key * (cum_dec[..., -1:] - cum_dec).exp().unsqueeze(-1)
+    chk_dec = cum_dec[..., -1].exp()[..., None, None]
+
+    for i in range(n_chunks):
+        v_new = new_values[:, :, i] - k_cumdec[:, :, i] @ rec
+        out[:, :, i] = query[:, :, i] @ rec + intra[:, :, i] @ v_new
+        rec = rec * chk_dec[:, :, i] + key[:, :, i].transpose(-1, -2) @ v_new
+
+    out = out.reshape(b, nv, -1, hv)[:, :, :seq_len].transpose(1, 2).contiguous().to(init_dt)
+    return out, (rec if output_final_state else None)
+
+
+class GatedDeltaNet(nn.Module):
+    """Native O(1)-state GatedDeltaNet linear-attention block for hybrid models (e.g. Qwen3.5)."""
+
+    def __init__(self, cfg: dict, layer_idx: int = 0):
+        super().__init__()
+        self.layer_idx = int(layer_idx)
+        self.hidden_size = int(cfg["dim"])
+        self.num_v_heads = int(cfg.get("linear_num_value_heads", 32))
+        self.num_k_heads = int(cfg.get("linear_num_key_heads", 16))
+        self.head_k_dim = int(cfg.get("linear_key_head_dim", 128))
+        self.head_v_dim = int(cfg.get("linear_value_head_dim", 128))
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.n_rep = self.num_v_heads // self.num_k_heads
+        self.conv_kernel_size = int(cfg.get("linear_conv_kernel_dim", 4))
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.eps = float(cfg.get("eps", 1e-6))
+
+        self.conv1d = nn.Conv1d(
+            self.conv_dim,
+            self.conv_dim,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+            bias=False,
+        )
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.A_log = nn.Parameter(torch.log(torch.empty(self.num_v_heads).uniform_(0.01, 16.0)))
+        self.norm = RMSNormGated(self.head_v_dim, eps=self.eps)
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
+        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+
+    def _expand_qk(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.n_rep <= 1:
+            return q, k
+        b, t, hk, d = q.shape
+        q = q.unsqueeze(3).expand(b, t, hk, self.n_rep, d).reshape(b, t, self.num_v_heads, d)
+        k = k.unsqueeze(3).expand(b, t, hk, self.n_rep, d).reshape(b, t, self.num_v_heads, d)
+        return q, k
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, _ = x.shape
+        qkv = self.in_proj_qkv(x).transpose(1, 2)
+        qkv = F.silu(self.conv1d(qkv)[:, :, :t]).transpose(1, 2)
+        q, k, v = torch.split(qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.view(b, t, self.num_k_heads, self.head_k_dim)
+        k = k.view(b, t, self.num_k_heads, self.head_k_dim)
+        v = v.view(b, t, self.num_v_heads, self.head_v_dim)
+        q, k = self._expand_qk(q, k)
+
+        z = self.in_proj_z(x).view(b, t, self.num_v_heads, self.head_v_dim)
+        beta = torch.sigmoid(self.in_proj_b(x))
+        g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(x).float() + self.dt_bias.float())
+
+        core, _ = _chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=64, output_final_state=False)
+        out = self.norm(core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)).view(b, t, self.value_dim)
+        return self.out_proj(out)
+
+    def step_graph(self, x: torch.Tensor, conv_state: torch.Tensor, rec_state: torch.Tensor) -> torch.Tensor:
+        """Single-token (`T==1`) CUDA-Graph-safe decode step updating conv_state and rec_state in-place."""
+        b = x.shape[0]
+        qkv_t = self.in_proj_qkv(x).transpose(1, 2)  # (B, conv_dim, 1)
+        comb = torch.cat([conv_state, qkv_t], dim=-1)  # (B, conv_dim, K)
+        conv_state.copy_(comb[:, :, -(self.conv_kernel_size - 1) :])
+        mixed = F.silu(F.conv1d(comb, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim).squeeze(-1))
+        q, k, v = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.view(b, 1, self.num_k_heads, self.head_k_dim)
+        k = k.view(b, 1, self.num_k_heads, self.head_k_dim)
+        q, k = self._expand_qk(q, k)
+        q_t = (_l2norm_last(q.float()) * (self.head_k_dim ** -0.5)).squeeze(1)
+        k_t = _l2norm_last(k.float()).squeeze(1)
+        v_t = v.view(b, self.num_v_heads, self.head_v_dim).float()
+
+        beta_t = torch.sigmoid(self.in_proj_b(x).squeeze(1)).float()
+        g_t = -self.A_log.float().exp() * F.softplus(self.in_proj_a(x).squeeze(1).float() + self.dt_bias.float())
+
+        rec_state.mul_(g_t.exp()[..., None, None])
+        kv_mem = (rec_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta_t.unsqueeze(-1)
+        rec_state.add_(k_t.unsqueeze(-1) * delta.unsqueeze(-2))
+        core = (rec_state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+        z = self.in_proj_z(x).view(b * self.num_v_heads, self.head_v_dim)
+        out = self.norm(core.to(x.dtype).reshape(b * self.num_v_heads, self.head_v_dim), z).view(b, 1, self.value_dim)
+        return self.out_proj(out)
+
+    def step_with_state(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        rec_state: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Multi-token (`T>=1`) or padded recurrent step updating conv_state and rec_state in-place."""
+        b, t, _ = x.shape
+        if valid_mask is None and t == 1:
+            return self.step_graph(x, conv_state, rec_state)
+
+        x_in = x * valid_mask.unsqueeze(-1).to(x.dtype) if valid_mask is not None else x
+        qkv_new = self.in_proj_qkv(x_in).transpose(1, 2)
+        comb = torch.cat([conv_state, qkv_new], dim=-1)
+        conv_state.copy_(comb[:, :, -(self.conv_kernel_size - 1) :])
+        mixed = F.silu(F.conv1d(comb, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim)).transpose(1, 2)
+
+        q, k, v = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.view(b, t, self.num_k_heads, self.head_k_dim)
+        k = k.view(b, t, self.num_k_heads, self.head_k_dim)
+        v = v.view(b, t, self.num_v_heads, self.head_v_dim)
+        q, k = self._expand_qk(q, k)
+
+        z = self.in_proj_z(x_in).view(b, t, self.num_v_heads, self.head_v_dim)
+        beta = torch.sigmoid(self.in_proj_b(x_in))
+        g = -self.A_log.float().exp() * F.softplus(self.in_proj_a(x_in).float() + self.dt_bias.float())
+        if valid_mask is not None:
+            vm = valid_mask.unsqueeze(-1)
+            beta = beta * vm.to(beta.dtype)
+            g = g * vm.to(g.dtype)
+
+        core, new_rec = _chunk_gated_delta_rule(
+            q, k, v, g, beta, chunk_size=64, initial_state=rec_state, output_final_state=True
+        )
+        rec_state.copy_(new_rec)
+        out = self.norm(core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)).view(b, t, self.value_dim)
+        return self.out_proj(out)

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .nn import RMSNorm, RoPE, apply_rope_cos_sin, apply_rope_pos, repeat_kv
+from .nn import GatedDeltaNet, RMSNorm, RoPE, apply_rope_cos_sin, apply_rope_pos, repeat_kv
 
 _RUNNER_UID = itertools.count(1)
 
@@ -66,13 +66,16 @@ class Bolt3Attn(nn.Module):
         self.max_cold_blocks = max(0, int(cfg.get("bolt3_max_cold_blocks", 256)))
         self.cold_topk = max(0, int(cfg.get("bolt3_cold_topk", 0)))
 
-        self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
+        self.packed_q_gate = bool(cfg.get("packed_q_gate", False))
+        q_out_dim = (H * HD * 2) if self.packed_q_gate else (H * HD)
+        self.q_proj = nn.Linear(D, q_out_dim, bias=qkv_bias)
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.v_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
         self.o_proj = nn.Linear(H * HD, D, bias=False)
         if cfg.get("qk_norm", False):
-            self.q_norm = RMSNorm(HD, float(cfg["eps"]))
-            self.k_norm = RMSNorm(HD, float(cfg["eps"]))
+            norm_off = float(cfg.get("rms_norm_offset", 0.0))
+            self.q_norm = RMSNorm(HD, float(cfg["eps"]), weight_offset=norm_off)
+            self.k_norm = RMSNorm(HD, float(cfg["eps"]), weight_offset=norm_off)
         else:
             self.q_norm, self.k_norm = None, None
         self.rope = RoPE(
@@ -97,14 +100,23 @@ class Bolt3Attn(nn.Module):
     def gamma_delta(self) -> torch.Tensor:
         return (0.999 * torch.sigmoid(self.log_gamma)).clamp(1e-3, 0.999).float()
 
-    def head_qkv(self, x: torch.Tensor):
+    def head_qkv_gate(self, x: torch.Tensor):
         b, t, _ = x.shape
-        q = self.q_proj(x).view(b, t, self.H, self.HD)
+        if self.packed_q_gate:
+            q, gate = torch.chunk(self.q_proj(x).view(b, t, self.H, self.HD * 2), 2, dim=-1)
+            gate = gate.reshape(b, t, self.H * self.HD)
+        else:
+            q = self.q_proj(x).view(b, t, self.H, self.HD)
+            gate = None
         k = self.k_proj(x).view(b, t, self.HKV, self.HD)
         v = self.v_proj(x).view(b, t, self.HKV, self.HD)
         if self.q_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
-        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), gate
+
+    def head_qkv(self, x: torch.Tensor):
+        q, k, v, _ = self.head_qkv_gate(x)
+        return q, k, v
 
     def _consolidate_functional(
         self,
@@ -566,7 +578,7 @@ class Bolt3Attn(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, T, _ = x.shape
-        q_raw, k_raw, v_all_in = self.head_qkv(x)
+        q_raw, k_raw, v_all_in, gate_all = self.head_qkv_gate(x)
         q_rope, k_rope = self.rope(q_raw), self.rope(k_raw)
         xp_f = x if (x.dtype == self.beta_proj.weight.dtype or torch.is_autocast_enabled("cuda")) else x.to(self.beta_proj.weight.dtype)
         beta_all = torch.sigmoid(self.beta_proj(xp_f)).transpose(1, 2)
@@ -690,8 +702,10 @@ class Bolt3Attn(nn.Module):
                         )
                 prev_kr, prev_kp, prev_v, prev_pos, prev_b = kc_r, kc_p, vc, pos_c, bc
 
-        y_out = torch.cat(ys, dim=2)
-        return self.o_proj(y_out.transpose(1, 2).reshape(b, T, self.H * self.HD))
+        out = torch.cat(ys, dim=2).transpose(1, 2).reshape(b, T, self.H * self.HD)
+        if gate_all is not None:
+            out = out * torch.sigmoid(gate_all)
+        return self.o_proj(out)
 
 
 def _steady_block_fast(
@@ -719,7 +733,7 @@ def _steady_block_fast(
     """Zero-cat single-token decode step across unified `[sink | ak_eff | half0 | half1 | cold]` buffers."""
     b = x.shape[0]
     h = norm1(x)
-    q_r, k_r, v_n = ly.head_qkv(h)
+    q_r, k_r, v_n, gate = ly.head_qkv_gate(h)
     rot_dim = cos.shape[-1]
     q_p = apply_rope_cos_sin(q_r, cos, sin, rot_dim)
     k_p = apply_rope_cos_sin(k_r, cos, sin, rot_dim)
@@ -749,12 +763,15 @@ def _steady_block_fast(
     ym_n = ly.res_norm(ym.reshape(b, ly.H, 1, ly.HD))
     y = y + (eta_n * ym_n).to(y.dtype)
 
-    x = x + ly.o_proj(y.transpose(1, 2).reshape(b, 1, ly.H * ly.HD))
+    out = y.transpose(1, 2).reshape(b, 1, ly.H * ly.HD)
+    if gate is not None:
+        out = out * torch.sigmoid(gate)
+    x = x + ly.o_proj(out)
     return x + mlp(norm2(x))
 
 
 class _Bolt3GraphRunner:
-    """CUDA Graph runner for steady-state (`cur_len < C`) single-token Bolt-3 decode."""
+    """CUDA Graph runner for steady-state (`cur_len < C`) single-token Bolt-3 / Hybrid GDN decode."""
 
     def __init__(
         self,
@@ -771,74 +788,98 @@ class _Bolt3GraphRunner:
         self.dtype = dtype
         self.cold_caps = cold_caps or tuple(0 for _ in model.blocks)
         self.L = len(model.blocks)
-        ly0: Bolt3Attn = model.blocks[0].attn
-        self.C = ly0.C
-        self.W1 = ly0.n_sinks + ly0.S + 2 * ly0.C
+        b3_layers = [blk.attn for blk in model.blocks if isinstance(blk.attn, Bolt3Attn)]
+        ly0 = b3_layers[0] if b3_layers else None
+        self.C = ly0.C if ly0 is not None else 128
+        self.W1 = (ly0.n_sinks + ly0.S + 2 * ly0.C) if ly0 is not None else self.C
 
         self.states: list[torch.Tensor] = []
-        self.buf_k: list[torch.Tensor] = []
-        self.buf_v: list[torch.Tensor] = []
-        self.mask_buf: list[torch.Tensor] = []
-        self.util_acc: list[torch.Tensor] = []
-        self.cur_kr: list[torch.Tensor] = []
-        self.cur_pos: list[torch.Tensor] = []
-        self.cur_b: list[torch.Tensor] = []
-        self.res_scales: list[torch.Tensor] = []
+        self.conv_states: list[torch.Tensor | None] = []
+        self.buf_k: list[torch.Tensor | None] = []
+        self.buf_v: list[torch.Tensor | None] = []
+        self.mask_buf: list[torch.Tensor | None] = []
+        self.util_acc: list[torch.Tensor | None] = []
+        self.cur_kr: list[torch.Tensor | None] = []
+        self.cur_pos: list[torch.Tensor | None] = []
+        self.cur_b: list[torch.Tensor | None] = []
+        self.res_scales: list[torch.Tensor | None] = []
 
         for li, blk in enumerate(model.blocks):
-            ly: Bolt3Attn = blk.attn
-            c_cap = self.cold_caps[li]
-            n_tot = ly.n_sinks + ly.S + 2 * ly.C + c_cap * ly.C
-            self.states.append(torch.zeros(batch_size, ly.HKV, ly.HD, ly.HD, device=device, dtype=torch.float32))
-            self.buf_k.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
-            self.buf_v.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
-            self.mask_buf.append(torch.zeros(batch_size, ly.HKV, 1, n_tot, device=device, dtype=torch.float32))
-            self.util_acc.append(torch.zeros(batch_size * ly.HKV, ly.S, device=device, dtype=torch.float32))
-            self.cur_kr.append(torch.zeros(batch_size, ly.HKV, ly.C, ly.HD, device=device, dtype=dtype))
-            self.cur_pos.append(torch.zeros(batch_size, 1, ly.C, device=device, dtype=torch.float32))
-            self.cur_b.append(torch.zeros(batch_size, ly.HKV, ly.C, device=device, dtype=dtype))
-            self.res_scales.append(((1.0 - ly.gamma_delta()).view(1, ly.HKV, 1, 1, 1) / (ly.HD ** 0.5)).to(device))
+            ly = blk.attn
+            if isinstance(ly, Bolt3Attn):
+                c_cap = self.cold_caps[li]
+                n_tot = ly.n_sinks + ly.S + 2 * ly.C + c_cap * ly.C
+                self.states.append(torch.zeros(batch_size, ly.HKV, ly.HD, ly.HD, device=device, dtype=torch.float32))
+                self.conv_states.append(None)
+                self.buf_k.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
+                self.buf_v.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
+                self.mask_buf.append(torch.zeros(batch_size, ly.HKV, 1, n_tot, device=device, dtype=torch.float32))
+                self.util_acc.append(torch.zeros(batch_size * ly.HKV, ly.S, device=device, dtype=torch.float32))
+                self.cur_kr.append(torch.zeros(batch_size, ly.HKV, ly.C, ly.HD, device=device, dtype=dtype))
+                self.cur_pos.append(torch.zeros(batch_size, 1, ly.C, device=device, dtype=torch.float32))
+                self.cur_b.append(torch.zeros(batch_size, ly.HKV, ly.C, device=device, dtype=dtype))
+                self.res_scales.append(((1.0 - ly.gamma_delta()).view(1, ly.HKV, 1, 1, 1) / (ly.HD ** 0.5)).to(device))
+            elif isinstance(ly, GatedDeltaNet):
+                self.states.append(
+                    torch.zeros(batch_size, ly.num_v_heads, ly.head_k_dim, ly.head_v_dim, device=device, dtype=torch.float32)
+                )
+                self.conv_states.append(
+                    torch.zeros(batch_size, ly.conv_dim, ly.conv_kernel_size - 1, device=device, dtype=dtype)
+                )
+                for lst in (self.buf_k, self.buf_v, self.mask_buf, self.util_acc, self.cur_kr, self.cur_pos, self.cur_b, self.res_scales):
+                    lst.append(None)
+            else:
+                raise TypeError(f"Unsupported layer type inside _Bolt3GraphRunner: {type(ly).__name__}")
 
         self.g_tok = torch.zeros(batch_size, 1, device=device, dtype=torch.long)
         self.g_pos = torch.zeros(batch_size, 1, 1, device=device, dtype=torch.float32)
         self.g_slot_buf = torch.zeros(1, device=device, dtype=torch.long)
         self.g_slot_cur = torch.zeros(1, device=device, dtype=torch.long)
-        self.g_zero_mask = torch.zeros(batch_size, ly0.HKV, 1, 1, device=device, dtype=torch.float32)
+        hkv_z = ly0.HKV if ly0 is not None else 1
+        self.g_zero_mask = torch.zeros(batch_size, hkv_z, 1, 1, device=device, dtype=torch.float32)
         self.g_out_h = torch.zeros(batch_size, 1, int(model.config["dim"]), device=device, dtype=dtype)
         self.slot_idxs = [torch.tensor([i], device=device, dtype=torch.long) for i in range(max(self.W1, self.C))]
-        self.inv_freq = ly0.rope.inv_freq.to(device)
+        self.inv_freq = ly0.rope.inv_freq.to(device) if ly0 is not None else None
         use_bf16_auto = dtype == torch.bfloat16
 
         def _forward_steady():
             with torch.autocast("cuda", torch.bfloat16, enabled=use_bf16_auto):
                 x = self.model.embed_tokens(self.g_tok)
-                freqs = self.g_pos.unsqueeze(-1) * self.inv_freq.view(1, 1, 1, -1)
-                emb = torch.cat((freqs, freqs), dim=-1)
-                cos = emb.cos().to(x.dtype)
-                sin = emb.sin().to(x.dtype)
+                if self.inv_freq is not None:
+                    freqs = self.g_pos.unsqueeze(-1) * self.inv_freq.view(1, 1, 1, -1)
+                    emb = torch.cat((freqs, freqs), dim=-1)
+                    cos = emb.cos().to(x.dtype)
+                    sin = emb.sin().to(x.dtype)
+                else:
+                    cos = sin = None
                 for li, blk in enumerate(self.model.blocks):
-                    x = _steady_block_fast(
-                        blk.attn,
-                        blk.norm1,
-                        blk.norm2,
-                        blk.mlp,
-                        x,
-                        cos,
-                        sin,
-                        self.g_pos,
-                        self.g_slot_buf,
-                        self.g_slot_cur,
-                        self.g_zero_mask,
-                        self.buf_k[li],
-                        self.buf_v[li],
-                        self.mask_buf[li],
-                        self.util_acc[li],
-                        self.cur_kr[li],
-                        self.cur_pos[li],
-                        self.cur_b[li],
-                        self.states[li],
-                        self.res_scales[li],
-                    )
+                    ly = blk.attn
+                    if isinstance(ly, Bolt3Attn):
+                        x = _steady_block_fast(
+                            ly,
+                            blk.norm1,
+                            blk.norm2,
+                            blk.mlp,
+                            x,
+                            cos,
+                            sin,
+                            self.g_pos,
+                            self.g_slot_buf,
+                            self.g_slot_cur,
+                            self.g_zero_mask,
+                            self.buf_k[li],
+                            self.buf_v[li],
+                            self.mask_buf[li],
+                            self.util_acc[li],
+                            self.cur_kr[li],
+                            self.cur_pos[li],
+                            self.cur_b[li],
+                            self.states[li],
+                            self.res_scales[li],
+                        )
+                    else:
+                        x = x + ly.step_graph(blk.norm1(x), self.conv_states[li], self.states[li])
+                        x = x + blk.mlp(blk.norm2(x))
                 return self.model.norm(x)
 
         s = torch.cuda.Stream(device=device)
@@ -856,6 +897,7 @@ class _Bolt3GraphRunner:
         self.graph = None
         for lst in (
             self.states,
+            self.conv_states,
             self.buf_k,
             self.buf_v,
             self.mask_buf,
@@ -898,13 +940,19 @@ class Bolt3Decoder:
         self._gam_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._slot_t_cache: dict[tuple, list[torch.Tensor]] = {}
         self._zero_m_cache: dict[tuple, torch.Tensor] = {}
-        self._all_bolt3 = all(isinstance(blk.attn, Bolt3Attn) for blk in model.blocks)
-        inv0 = model.blocks[0].attn.rope.inv_freq
-        self._shared_rope = self._all_bolt3 and all(
-            blk.attn.rope.rotary_dim == model.blocks[0].attn.rope.rotary_dim
-            and torch.equal(blk.attn.rope.inv_freq, inv0)
-            for blk in model.blocks
-        )
+        self._b3_indices = [li for li, blk in enumerate(model.blocks) if isinstance(blk.attn, Bolt3Attn)]
+        self._all_fast_step = all(isinstance(blk.attn, (Bolt3Attn, GatedDeltaNet)) for blk in model.blocks)
+        self._all_bolt3 = self._all_fast_step and (len(self._b3_indices) == len(model.blocks))
+        self._first_bolt3 = model.blocks[self._b3_indices[0]].attn if self._b3_indices else None
+        if self._first_bolt3 is not None:
+            inv0 = self._first_bolt3.rope.inv_freq
+            self._shared_rope = self._all_fast_step and all(
+                model.blocks[li].attn.rope.rotary_dim == self._first_bolt3.rope.rotary_dim
+                and torch.equal(model.blocks[li].attn.rope.inv_freq, inv0)
+                for li in self._b3_indices
+            )
+        else:
+            self._shared_rope = self._all_fast_step
 
     @staticmethod
     def state_bytes(model) -> tuple[int, int]:
@@ -921,6 +969,8 @@ class Bolt3Decoder:
                 )
                 if ly.is_cold_armed and ly.max_cold_blocks > 0:
                     per_tok += 2 * ly.HKV * ly.HD * 2
+            elif isinstance(ly, GatedDeltaNet):
+                flat += ly.num_v_heads * ly.head_k_dim * ly.head_v_dim * 4 + ly.conv_dim * (ly.conv_kernel_size - 1) * 2
             else:
                 per_tok += 2 * ly.HKV * ly.HD * 2
         return flat, per_tok
@@ -991,6 +1041,16 @@ class Bolt3Decoder:
                     "_synced_ids": None,
                     "_runner_id": None,
                 }
+            elif isinstance(ly, GatedDeltaNet):
+                states[li] = torch.zeros(
+                    batch_size, ly.num_v_heads, ly.head_k_dim, ly.head_v_dim, device=device, dtype=state_dtype
+                )
+                kv_caches[li] = {
+                    "conv_state": torch.zeros(
+                        batch_size, ly.conv_dim, ly.conv_kernel_size - 1, device=device, dtype=dt
+                    ),
+                    "_runner_id": None,
+                }
             else:
                 kv_caches[li] = StaticKV(batch_size, ly.HKV, max_kv_len, ly.HD, device, dt=dt)
         return states, kv_caches
@@ -1002,13 +1062,17 @@ class Bolt3Decoder:
                 s.zero_()
         for c in kv_caches:
             if isinstance(c, dict):
-                for k in list(c.keys()):
-                    if k in ("n_filled", "cur_len", "cur_half", "cold_cap_blks"):
-                        c[k] = 0
-                    elif k in ("prev_has_pad", "cur_has_pad", "has_prev"):
-                        c[k] = False
-                    else:
-                        c[k] = None
+                if "conv_state" in c:
+                    c["conv_state"].zero_()
+                    c["_runner_id"] = None
+                else:
+                    for k in list(c.keys()):
+                        if k in ("n_filled", "cur_len", "cur_half", "cold_cap_blks"):
+                            c[k] = 0
+                        elif k in ("prev_has_pad", "cur_has_pad", "has_prev"):
+                            c[k] = False
+                        else:
+                            c[k] = None
             elif isinstance(c, StaticKV):
                 c.n = 0
 
@@ -1553,7 +1617,7 @@ class Bolt3Decoder:
             sc["_synced_ids"] = None
             sc["buf_k"] = None
             h = blk.norm1(x)
-            q_r, k_r, v_n = ly.head_qkv(h)
+            q_r, k_r, v_n, gate = ly.head_qkv_gate(h)
             if pos_ids is None:
                 if _rope_cs is not None:
                     cos, sin = _rope_cs
@@ -1678,13 +1742,20 @@ class Bolt3Decoder:
                 ym_n = ly.res_norm(ym.reshape(b, ly.H, t_s, ly.HD))
                 y = y + (eta_n * ym_n).to(y.dtype)
 
-            x = x + ly.o_proj(y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD))
+            out_blk = y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD)
+            if gate is not None:
+                out_blk = out_blk * torch.sigmoid(gate)
+            x = x + ly.o_proj(out_blk)
 
             if new_len >= ly.C:
                 self._consolidate_layer(li, ly, sc, states, b, device, inv_freq, gam, unified=False)
+        elif isinstance(ly, GatedDeltaNet):
+            sc = kv_caches[li]
+            h = blk.norm1(x)
+            x = x + ly.step_with_state(h, sc["conv_state"], states[li], valid_mask=valid_mask)
         else:
             h = blk.norm1(x)
-            q, k, v = ly.head_qkv(h)
+            q, k, v, gate = ly.head_qkv_gate(h)
             q, k = ly.rope(q, pos_start=pos_start), ly.rope(k, pos_start=pos_start)
             n_prev = kv_caches[li].n
             pk, pv = kv_caches[li].append(k, v)
@@ -1707,7 +1778,12 @@ class Bolt3Decoder:
                     y = F.scaled_dot_product_attention(
                         q, repeat_kv(pk.to(q.dtype), ly.G), repeat_kv(pv.to(q.dtype), ly.G)
                     )
-            x = x + ly.o_proj(y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD))
+            out_blk = y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD)
+            if gate is not None:
+                out_blk = out_blk * torch.sigmoid(gate)
+            elif getattr(ly, "g_proj", None) is not None:
+                out_blk = out_blk * torch.sigmoid(ly.g_proj(h))
+            x = x + ly.o_proj(out_blk)
 
         return x + blk.mlp(blk.norm2(x))
 
@@ -1716,9 +1792,12 @@ class Bolt3Decoder:
     ) -> bool:
         if not (tokens.is_cuda and tokens.shape[1] == 1 and valid_mask is None and self.use_cuda_graph):
             return False
-        if not (self._all_bolt3 and self._shared_rope and len(kv_caches) == len(self.model.blocks)):
+        if not (self._all_fast_step and self._shared_rope and len(kv_caches) == len(self.model.blocks)):
             return False
-        if any(blk.attn.is_cold_armed and blk.attn.max_cold_blocks > 0 and blk.attn.cold_topk > 0 for blk in self.model.blocks):
+        if any(
+            isinstance(blk.attn, Bolt3Attn) and blk.attn.is_cold_armed and blk.attn.max_cold_blocks > 0 and blk.attn.cold_topk > 0
+            for blk in self.model.blocks
+        ):
             return False
         b = tokens.shape[0]
         if b == 1:
@@ -1733,7 +1812,7 @@ class Bolt3Decoder:
             cold_mb = sum(
                 b * cap * blk.attn.C * blk.attn.HKV * blk.attn.HD * 5 // (1024 * 1024)
                 for cap, blk in zip(cold_caps, self.model.blocks)
-                if cap > 0
+                if cap > 0 and isinstance(blk.attn, Bolt3Attn)
             )
             return free_b >= (b * 128 + cold_mb + 2048) * 1024 * 1024
         except Exception:
@@ -1773,7 +1852,20 @@ class Bolt3Decoder:
         rid = runner.uid
         for li, blk in enumerate(dec.model.blocks):
             sc = kv_caches[li]
-            ly: Bolt3Attn = blk.attn
+            ly = blk.attn
+            if isinstance(ly, GatedDeltaNet):
+                expected_sig = (rid, id(states[li]), id(sc.get("conv_state")))
+                if sc.get("_runner_id") == expected_sig and runner.states[li] is states[li]:
+                    continue
+                if runner.states[li] is not states[li]:
+                    runner.states[li].copy_(states[li])
+                    states[li] = runner.states[li]
+                if runner.conv_states[li] is not sc["conv_state"]:
+                    runner.conv_states[li].copy_(sc["conv_state"])
+                    sc["conv_state"] = runner.conv_states[li]
+                sc["_runner_id"] = (rid, id(states[li]), id(sc["conv_state"]))
+                continue
+
             cold_cap = runner.cold_caps[li]
             expected_sig = (
                 rid,
@@ -1865,28 +1957,34 @@ class Bolt3Decoder:
             b = tokens.shape[0]
             cold_caps = (
                 tuple(
-                    self._cold_cap_for(blk.attn, kv_caches[li]) if isinstance(kv_caches[li], dict) else 0
+                    self._cold_cap_for(blk.attn, kv_caches[li])
+                    if (isinstance(blk.attn, Bolt3Attn) and isinstance(kv_caches[li], dict))
+                    else 0
                     for li, blk in enumerate(m.blocks)
                 )
                 if len(kv_caches) == len(m.blocks)
                 else ()
             )
             if self._can_use_graph(tokens, valid_mask, kv_caches, dt, cold_caps):
-                len0 = int(kv_caches[0].get("cur_len", 0))
-                half0 = int(kv_caches[0].get("cur_half", 0))
-                if all(c.get("cur_len", 0) == len0 and c.get("cur_half", 0) == half0 for c in kv_caches):
+                b3 = self._b3_indices
+                len0 = int(kv_caches[b3[0]].get("cur_len", 0)) if b3 else 0
+                half0 = int(kv_caches[b3[0]].get("cur_half", 0)) if b3 else 0
+                if (not b3) or all(
+                    kv_caches[li].get("cur_len", 0) == len0 and kv_caches[li].get("cur_half", 0) == half0
+                    for li in b3
+                ):
                     runner = self._get_graph_runner(b, tokens.device, dt, cold_caps)
                     self._bind_graph_state(self, runner, states, kv_caches, b, tokens.device, dt)
-                    ly0: Bolt3Attn = m.blocks[0].attn
-                    slot_buf = ly0.n_sinks + ly0.S + half0 * ly0.C + len0
+                    ly0 = self._first_bolt3
+                    slot_buf = (ly0.n_sinks + ly0.S + half0 * ly0.C + len0) if ly0 is not None else 0
                     out_h = runner.replay(tokens, pos_start, pos_ids, slot_buf, len0)
                     new_len = len0 + 1
-                    for sc in kv_caches:
-                        sc["cur_len"] = new_len
-                    if new_len >= ly0.C:
+                    for li in b3:
+                        kv_caches[li]["cur_len"] = new_len
+                    if ly0 is not None and new_len >= ly0.C:
                         inv_freq = ly0.rope.inv_freq.to(tokens.device)
-                        for li, blk in enumerate(m.blocks):
-                            ly = blk.attn
+                        for li in b3:
+                            ly = m.blocks[li].attn
                             gam, _ = self._get_gam_scale(ly, tokens.device)
                             self._consolidate_layer(li, ly, kv_caches[li], states, b, tokens.device, inv_freq, gam, unified=True)
                     return out_h, states, kv_caches
@@ -1894,8 +1992,8 @@ class Bolt3Decoder:
             with torch.autocast("cuda", torch.bfloat16, enabled=use_bf16):
                 x = m.embed_tokens(tokens)
                 rope_cs = None
-                if self._shared_rope:
-                    rope_cs = m.blocks[0].attn.rope.cos_sin(pos_start, 1, tokens.device, x.dtype, pos_ids=pos_ids)
+                if self._shared_rope and self._first_bolt3 is not None:
+                    rope_cs = self._first_bolt3.rope.cos_sin(pos_start, 1, tokens.device, x.dtype, pos_ids=pos_ids)
                 for li, blk in enumerate(m.blocks):
                     x = self.step_block(
                         li, blk, x, pos_start, states, kv_caches, pos_ids=pos_ids, valid_mask=valid_mask, _rope_cs=rope_cs
@@ -1908,7 +2006,7 @@ class Bolt3Decoder:
         while s < t_tot:
             cur_len = 0
             for c in kv_caches:
-                if isinstance(c, dict):
+                if isinstance(c, dict) and "cur_len" in c:
                     cur_len = c.get("cur_len", 0)
                     break
             take = min(t_tot - s, self.C - cur_len)
@@ -1917,8 +2015,8 @@ class Bolt3Decoder:
             with torch.autocast("cuda", torch.bfloat16, enabled=use_bf16):
                 x = m.embed_tokens(tokens[:, s : s + take])
                 rope_cs = None
-                if self._shared_rope:
-                    rope_cs = m.blocks[0].attn.rope.cos_sin(pos, take, tokens.device, x.dtype, pos_ids=p_slice)
+                if self._shared_rope and self._first_bolt3 is not None:
+                    rope_cs = self._first_bolt3.rope.cos_sin(pos, take, tokens.device, x.dtype, pos_ids=p_slice)
                 for li, blk in enumerate(m.blocks):
                     x = self.step_block(
                         li, blk, x, pos, states, kv_caches, pos_ids=p_slice, valid_mask=v_slice, _rope_cs=rope_cs

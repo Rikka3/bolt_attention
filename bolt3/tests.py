@@ -540,6 +540,121 @@ def test_cold_armed_parity():
             torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
+def test_qwen3_5_hybrid_gdn_and_packed_gate_parity():
+    dev = _device()
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32 if dev.type == "cuda" else None
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        torch.manual_seed(11)
+        cfg = dict(
+            vocab_size=256,
+            dim=64,
+            num_layers=4,
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=32,
+            intermediate=128,
+            max_T=256,
+            rope_theta=10_000_000.0,
+            partial_rotary_factor=0.25,
+            qk_norm=True,
+            rms_norm_offset=1.0,
+            packed_q_gate=True,
+            bolt3_S=16,
+            bolt3_C=16,
+            bolt3_n_sinks=4,
+            layer_types=["linear_attention", "bolt3", "linear_attention", "bolt3"],
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=16,
+            linear_num_key_heads=2,
+            linear_value_head_dim=16,
+            linear_num_value_heads=4,
+        )
+        m = Bolt3LM(**cfg).to(dev).float().eval()
+        with torch.no_grad():
+            for blk in m.blocks:
+                if hasattr(blk.attn, "eta_proj"):
+                    blk.attn.eta_proj.bias.fill_(0.4)
+                    blk.attn.res_norm.weight.fill_(0.5)
+
+        x = torch.randint(1, 256, (1, 70), device=dev)
+        with torch.no_grad():
+            h_fwd = m(x)
+            dec = Bolt3Decoder(m)
+            hp, st, kv = dec.prefill(x[:, :37])
+            outs = [hp]
+            for pos in range(37, 70):
+                hs, st, kv = dec.step(x[:, pos : pos + 1], pos, st, kv)
+                outs.append(hs)
+            h_dec = torch.cat(outs, dim=1)
+            diff = float((h_fwd - h_dec).abs().max().item())
+        tol = 5e-2 if dev.type == "cuda" else 1e-4
+        assert diff < tol, f"qwen3.5 hybrid forward vs decode diff={diff}"
+
+        # Gradient flow check across both GatedDeltaNet and Bolt3Attn parameters
+        m.train()
+        mt = Bolt3LM(**cfg).to(dev).float().train()
+        with torch.no_grad():
+            for p_src, p_dst in zip(m.parameters(), mt.parameters()):
+                p_dst.copy_(p_src)
+        xt = torch.randint(0, 256, (2, 70), device=dev)
+        ht = mt(xt)
+        loss = ht.pow(2).mean()
+        loss.backward()
+        assert mt.blocks[0].attn.A_log.grad is not None and mt.blocks[0].attn.conv1d.weight.grad is not None
+        assert mt.blocks[1].attn.log_gamma.grad is not None and mt.blocks[1].attn.q_proj.weight.grad is not None
+
+        # Left-padded batch generation parity (crossing both prefill & chunk consolidation boundaries)
+        m.eval()
+        dec_b = Bolt3Decoder(m)
+        p1 = torch.randint(1, 256, (1, 5), device=dev)
+        p2 = torch.randint(1, 256, (1, 45), device=dev)
+        ids_b = torch.zeros((2, 45), dtype=torch.long, device=dev)
+        mask_b = torch.zeros((2, 45), dtype=torch.long, device=dev)
+        ids_b[0, 40:] = p1[0]
+        mask_b[0, 40:] = 1
+        ids_b[1] = p2[0]
+        mask_b[1] = 1
+        with torch.no_grad():
+            ref1 = dec_b.generate(p1, 20, temperature=0.0)[0, 5:].tolist()
+            ref2 = dec_b.generate(p2, 20, temperature=0.0)[0, 45:].tolist()
+            bat, _ = dec_b.generate_batch(ids_b, 20, temperature=0.0, attn_mask=mask_b)
+            assert bat[0].tolist() == ref1 and bat[1].tolist() == ref2
+
+        flat_b, per_tok_b = Bolt3Decoder.state_bytes(m)
+        assert flat_b > 0 and per_tok_b == 0
+
+        bf16_msg = "cpu-skip"
+        if dev.type == "cuda":
+            m_bf = Bolt3LM(**cfg).to(dev).to(torch.bfloat16).eval()
+            for n, p in m_bf.named_parameters():
+                if any(k in n for k in ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm", "A_log", "dt_bias")):
+                    p.data = p.data.float()
+            d_cg = Bolt3Decoder(m_bf, use_cuda_graph=True)
+            d_eg = Bolt3Decoder(m_bf, use_cuda_graph=False)
+            with torch.no_grad():
+                xc = torch.randint(1, 256, (1, 90), device=dev)
+                hc, sc_c, kvc = d_cg.prefill(xc[:, :20])
+                he, se, kve = d_eg.prefill(xc[:, :20])
+                oc, oe = [hc], [he]
+                for p in range(20, 90):
+                    hc, sc_c, kvc = d_cg.step(xc[:, p : p + 1], p, sc_c, kvc)
+                    he, se, kve = d_eg.step(xc[:, p : p + 1], p, se, kve)
+                    oc.append(hc)
+                    oe.append(he)
+                d_bf = float((torch.cat(oc, dim=1) - torch.cat(oe, dim=1)).abs().max().item())
+            d_cg.close()
+            d_eg.close()
+            assert d_bf < 5e-2, f"qwen3.5 bf16 graph vs eager diff={d_bf}"
+            bf16_msg = f"{d_bf:.2e}"
+
+        print(f"[qwen3.5 hybrid GDN+gate]  fwd_vs_dec={diff:.2e}  batch=exact  bf16_graph={bf16_msg}")
+    finally:
+        if old_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
 def run_all():
     print(f"Running Bolt-3 test suite on {_device()}...")
     test_forward_decode_parity()
@@ -549,6 +664,7 @@ def run_all():
     test_qwen3_style_gqa_and_legacy_remap()
     test_left_padded_batch_parity()
     test_cold_armed_parity()
+    test_qwen3_5_hybrid_gdn_and_packed_gate_parity()
     print("ALL BOLT-3 TESTS PASSED")
 
 

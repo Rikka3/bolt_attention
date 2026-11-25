@@ -16,11 +16,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from .attention import Bolt3Decoder
+from .attention import Bolt3Attn, Bolt3Decoder
 from .converter import _purge_zombie_vram
 from .inspector import fetch_any_donor
 from .memory_bank import Bolt3MemoryBank
 from .model import load_bolt3_checkpoint
+from .nn import GatedDeltaNet
 from .server import get_all_eos_ids
 
 try:
@@ -78,7 +79,7 @@ def _load_hf_donor(donor_dir: str, device: torch.device):
     import transformers
 
     m = None
-    for cls_n in ("AutoModelForCausalLM",):
+    for cls_n in ("AutoModelForCausalLM", "AutoModelForImageTextToText", "Qwen3_5ForConditionalGeneration"):
         cls = getattr(transformers, cls_n, None)
         if cls is None:
             continue
@@ -832,6 +833,15 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
         states_s, kv_s = dec_stu.blank_state(stu, 1, device, max_kv_len=t_ctx + gen_steps + 32)
         for li, blk in enumerate(stu.blocks):
             ly = blk.attn
+            if isinstance(ly, GatedDeltaNet):
+                states_s[li] = (
+                    torch.randn(1, ly.num_v_heads, ly.head_k_dim, ly.head_v_dim, device=device, dtype=torch.float32)
+                    * 0.02
+                )
+                kv_s[li]["conv_state"] = (
+                    torch.randn(1, ly.conv_dim, ly.conv_kernel_size - 1, device=device, dtype=torch.bfloat16) * 0.02
+                )
+                continue
             kv_s[li]["sink_k"] = torch.randn(1, ly.HKV, ly.n_sinks, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
             kv_s[li]["sink_v"] = torch.randn_like(kv_s[li]["sink_k"])
             kv_s[li]["sink_valid"] = torch.ones(1, 1, ly.n_sinks, device=device, dtype=torch.bool)
@@ -874,16 +884,40 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
         L = cfg["num_layers"]
         HKV = cfg["num_kv_heads"]
         HD = cfg["head_dim"]
+        layer_types = cfg.get("layer_types") or ["bolt3"] * L
+        is_hybrid = any(lt == "linear_attention" for lt in layer_types)
+        n_full_donor = sum(1 for lt in layer_types if lt != "linear_attention")
+        lin_donor_bytes = sum(
+            ly.num_v_heads * ly.head_k_dim * ly.head_v_dim * 4 + ly.conv_dim * (ly.conv_kernel_size - 1) * 2
+            for blk in stu.blocks
+            for ly in (blk.attn,)
+            if isinstance(ly, GatedDeltaNet)
+        )
         inner_hf = getattr(getattr(hf_donor, "model", hf_donor), "language_model", getattr(hf_donor, "model", hf_donor))
+        hf_cache_cls = None
+        if is_hybrid:
+            try:
+                from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+
+                hf_cache_cls = Qwen3_5DynamicCache
+            except Exception:
+                hf_cache_cls = None
 
         def _make_donor_cache(t_ctx: int):
-            c = DynamicCache()
+            if hf_cache_cls is not None:
+                c = hf_cache_cls(config=inner_hf.config)
+            else:
+                try:
+                    c = DynamicCache(config=inner_hf.config)
+                except TypeError:
+                    c = DynamicCache()
             for li in range(L):
-                c.update(
-                    torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
-                    torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
-                    li,
-                )
+                if not is_hybrid or layer_types[li] != "linear_attention":
+                    c.update(
+                        torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
+                        torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
+                        li,
+                    )
             return c
 
         for T_c in ctx_lengths:
@@ -911,7 +945,7 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
             bolt3_tok_s = statistics.median(runs_s)
             torch.cuda.empty_cache()
 
-            donor_kv_mb = (L * 2 * HKV * HD * T_c * 2) / (1024 ** 2)
+            donor_kv_mb = (n_full_donor * 2 * HKV * HD * T_c * 2 + lin_donor_bytes) / (1024 ** 2)
             cache_hf = _make_donor_cache(T_c)
             with torch.autocast("cuda", torch.bfloat16):
                 o_w = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
