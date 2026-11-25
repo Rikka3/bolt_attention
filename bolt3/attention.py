@@ -37,7 +37,14 @@ class StaticKV:
 
 
 class Bolt3Attn(nn.Module):
-    def __init__(self, cfg: dict, max_T: int = 2048, S: int | None = None, C: int | None = None):
+    def __init__(
+        self,
+        cfg: dict,
+        max_T: int = 2048,
+        S: int | None = None,
+        C: int | None = None,
+        layer_idx: int = 0,
+    ):
         super().__init__()
         D, H, HKV = int(cfg["dim"]), int(cfg["num_heads"]), int(cfg["num_kv_heads"])
         HD = int(cfg.get("head_dim") or (D // H))
@@ -49,6 +56,11 @@ class Bolt3Attn(nn.Module):
         self.sim_k = float(cfg.get("bolt3_sim_k", 0.94))
         self.sim_v = float(cfg.get("bolt3_sim_v", 0.88))
         self.gamma_u = float(cfg.get("bolt3_gamma_u", 0.985))
+        cold_layers = {int(i) for i in (cfg.get("bolt3_cold_layers") or ())}
+        self.layer_idx = int(layer_idx)
+        self.is_cold_armed = self.layer_idx in cold_layers
+        self.max_cold_blocks = max(0, int(cfg.get("bolt3_max_cold_blocks", 256)))
+        self.cold_topk = max(0, int(cfg.get("bolt3_cold_topk", 0)))
 
         self.q_proj = nn.Linear(D, H * HD, bias=qkv_bias)
         self.k_proj = nn.Linear(D, HKV * HD, bias=qkv_bias)
@@ -399,6 +411,155 @@ class Bolt3Attn(nn.Module):
         m_res = gam_bh * m_res + torch.bmm(k_ev.transpose(1, 2), err_v)
         return ak, av, mass, util, pm, act, m_res, n_filled
 
+    def _cold_block_bounds(self, p_kp: torch.Tensor, p_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        b, hkv, c_sz, _ = p_kp.shape
+        m_exp = p_mask.unsqueeze(-1).expand(b, hkv, c_sz, self.HD)
+        kmin = p_kp.masked_fill(~m_exp, 1e4).amin(dim=2, keepdim=True)
+        kmax = p_kp.masked_fill(~m_exp, -1e4).amax(dim=2, keepdim=True)
+        return kmin, kmax
+
+    def _push_cold_block(
+        self,
+        cold_k: torch.Tensor | None,
+        cold_v: torch.Tensor | None,
+        cold_m: torch.Tensor | None,
+        cold_pos: torch.Tensor | None,
+        cold_b: torch.Tensor | None,
+        cold_kmin: torch.Tensor | None,
+        cold_kmax: torch.Tensor | None,
+        p_kp: torch.Tensor,
+        p_v: torch.Tensor,
+        p_mask: torch.Tensor,
+        p_pos: torch.Tensor,
+        p_b: torch.Tensor,
+    ):
+        """Append one chunk `(b, HKV, C, HD)` to cold memory; pop oldest block if past `max_cold_blocks`."""
+        kb = p_kp.unsqueeze(2)
+        vb = p_v.unsqueeze(2)
+        mb = p_mask.unsqueeze(2)
+        pb = p_pos.unsqueeze(2)
+        bb = p_b.unsqueeze(2)
+        if self.cold_topk > 0:
+            kmin_new, kmax_new = self._cold_block_bounds(p_kp, p_mask)
+        else:
+            kmin_new = kmax_new = None
+
+        if cold_k is None:
+            cold_k, cold_v, cold_m, cold_pos, cold_b = (
+                kb.clone(),
+                vb.clone(),
+                mb.clone(),
+                pb.clone(),
+                bb.clone(),
+            )
+            cold_kmin, cold_kmax = kmin_new, kmax_new
+        else:
+            cold_k = torch.cat([cold_k, kb], dim=2)
+            cold_v = torch.cat([cold_v, vb], dim=2)
+            cold_m = torch.cat([cold_m, mb], dim=2)
+            cold_pos = torch.cat([cold_pos, pb], dim=2)
+            cold_b = torch.cat([cold_b, bb], dim=2)
+            if kmin_new is not None and cold_kmin is not None:
+                cold_kmin = torch.cat([cold_kmin, kmin_new], dim=2)
+                cold_kmax = torch.cat([cold_kmax, kmax_new], dim=2)
+
+        popped = None
+        if cold_k.shape[2] > self.max_cold_blocks:
+            popped = (
+                cold_k[:, :, 0],
+                cold_v[:, :, 0],
+                cold_m[:, :, 0],
+                cold_pos[:, :, 0],
+                cold_b[:, :, 0],
+            )
+            cold_k = cold_k[:, :, 1:]
+            cold_v = cold_v[:, :, 1:]
+            cold_m = cold_m[:, :, 1:]
+            cold_pos = cold_pos[:, :, 1:]
+            cold_b = cold_b[:, :, 1:]
+            if cold_kmin is not None:
+                cold_kmin = cold_kmin[:, :, 1:]
+                cold_kmax = cold_kmax[:, :, 1:]
+        return cold_k, cold_v, cold_m, cold_pos, cold_b, cold_kmin, cold_kmax, popped
+
+    def _attend_with_cold(
+        self,
+        qg: torch.Tensor,
+        sp: list[torch.Tensor],
+        vp: list[torch.Tensor],
+        cold_k: torch.Tensor | None,
+        cold_v: torch.Tensor | None,
+        cold_m: torch.Tensor | None,
+        cold_kmin: torch.Tensor | None,
+        cold_kmax: torch.Tensor | None,
+        att_slice: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Exact attention over `[sink, ak, loc]` plus optional cold blocks (all or interval top-k)."""
+        b, hkv, g_sz, t_q, hd = qg.shape
+        scale = hd ** -0.5
+        if cold_k is None or cold_k.shape[2] == 0:
+            scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
+            v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
+            probs = F.softmax(scores, dim=-1)
+            att_p = probs[..., att_slice[0] : att_slice[1]] if att_slice is not None else None
+            y = torch.matmul(probs.to(v_cat.dtype), v_cat.unsqueeze(2)).reshape(b, self.H, t_q, hd)
+            return y, att_p
+
+        n_cb, c_sz = cold_k.shape[2], cold_k.shape[3]
+        if self.cold_topk <= 0 or n_cb <= self.cold_topk:
+            kc = cold_k.reshape(b, hkv, n_cb * c_sz, hd)
+            vc = cold_v.reshape(b, hkv, n_cb * c_sz, hd)
+            mc = cold_m.reshape(b, 1, 1, 1, n_cb * c_sz)
+            s_cold = torch.matmul(qg.float(), kc.float().unsqueeze(2).transpose(-1, -2)) * scale
+            s_cold = s_cold.masked_fill(~mc, float("-inf"))
+            scores = torch.cat(sp + [s_cold], dim=-1)
+            v_cat = torch.cat(vp + [vc], dim=2)
+            probs = F.softmax(scores, dim=-1)
+            att_p = probs[..., att_slice[0] : att_slice[1]] if att_slice is not None else None
+            y = torch.matmul(probs.to(v_cat.dtype), v_cat.unsqueeze(2)).reshape(b, self.H, t_q, hd)
+            return y, att_p
+
+        # Top-k cold blocks selected per query token via interval bounds [kmin, kmax], merged via logsumexp.
+        if cold_kmin is None or cold_kmax is None:
+            m_exp = cold_m.unsqueeze(-1).expand(b, hkv, n_cb, c_sz, hd)
+            cold_kmin = cold_k.masked_fill(~m_exp, 1e4).amin(dim=3)
+            cold_kmax = cold_k.masked_fill(~m_exp, -1e4).amax(dim=3)
+        qp5 = qg.float().unsqueeze(4)
+        kmax6 = cold_kmax.float().unsqueeze(2).unsqueeze(2)
+        kmin6 = cold_kmin.float().unsqueeze(2).unsqueeze(2)
+        ub = (qp5.clamp_min(0) * kmax6 + qp5.clamp_max(0) * kmin6).sum(-1).amax(dim=2)  # (b, hkv, t_q, n_cb)
+        top_idx = torch.topk(ub, k=self.cold_topk, dim=-1, largest=True).indices  # (b, hkv, t_q, K)
+        gk = top_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, c_sz, hd)
+        k_sel = torch.gather(cold_k.unsqueeze(2).expand(-1, -1, t_q, -1, -1, -1), 3, gk).reshape(
+            b, hkv, 1, t_q, self.cold_topk * c_sz, hd
+        )
+        v_sel = torch.gather(cold_v.unsqueeze(2).expand(-1, -1, t_q, -1, -1, -1), 3, gk).reshape(
+            b, hkv, 1, t_q, self.cold_topk * c_sz, hd
+        )
+        m_sel = torch.gather(
+            cold_m.expand(b, hkv, -1, -1).unsqueeze(2).expand(-1, -1, t_q, -1, -1),
+            3,
+            top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, c_sz),
+        ).reshape(b, hkv, 1, t_q, self.cold_topk * c_sz)
+        s_cold = (qp5 * k_sel.float()).sum(-1) * scale
+        s_cold = s_cold.masked_fill(~m_sel, float("-inf"))
+
+        scores_o = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
+        v_o = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
+        lse_o = torch.logsumexp(scores_o, dim=-1, keepdim=True)
+        lse_c = torch.logsumexp(s_cold, dim=-1, keepdim=True)
+        lse_all = torch.logaddexp(lse_o, lse_c)
+        w_o = torch.exp(lse_o - lse_all)
+        w_c = torch.exp(lse_c - lse_all)
+
+        p_o = F.softmax(scores_o, dim=-1)
+        p_c = torch.where(m_sel, F.softmax(s_cold, dim=-1), 0.0)
+        y_o = torch.matmul(p_o.to(v_o.dtype), v_o.unsqueeze(2)).float()
+        y_c = (p_c.to(v_sel.dtype).unsqueeze(-1) * v_sel).sum(dim=4).float()
+        y = (w_o * y_o + w_c * y_c).to(v_o.dtype).reshape(b, self.H, t_q, hd)
+        att_p = (p_o[..., att_slice[0] : att_slice[1]] * w_o) if att_slice is not None else None
+        return y, att_p
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, T, _ = x.shape
         q_raw, k_raw, v_all_in = self.head_qkv(x)
@@ -412,6 +573,7 @@ class Bolt3Attn(nn.Module):
 
         sink_k = sink_v = ak = av = mass = util = pm = act = m_res = None
         prev_kr = prev_kp = prev_v = prev_pos = prev_b = None
+        cold_k = cold_v = cold_m = cold_pos = cold_b = cold_kmin = cold_kmax = None
         n_filled = 0
         ys = []
 
@@ -455,20 +617,12 @@ class Bolt3Attn(nn.Module):
 
             sp.append(s_loc)
             vp.append(loc_v)
-            scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
-            v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
-            probs = F.softmax(scores, dim=-1)
-            if ak is not None:
+            att_slice = ((sink_k.shape[2] if sink_k is not None else 0), (sink_k.shape[2] if sink_k is not None else 0) + self.S) if ak is not None else None
+            yc, att_p = self._attend_with_cold(qg, sp, vp, cold_k, cold_v, cold_m, cold_kmin, cold_kmax, att_slice=att_slice)
+            if ak is not None and att_p is not None:
                 with torch.no_grad():
-                    att_off = sink_k.shape[2] if sink_k is not None else 0
-                    att_hit = (
-                        0.25
-                        * probs[..., att_off : att_off + self.S]
-                        .mean(dim=(2, 3))
-                        .reshape(b * self.HKV, self.S)
-                    )
+                    att_hit = (0.25 * att_p.mean(dim=(2, 3)).reshape(b * self.HKV, self.S))
                     util = torch.maximum(util, att_hit)
-            yc = torch.matmul(probs.to(v_cat.dtype), v_cat.unsqueeze(2)).reshape(b, self.H, tc, self.HD)
 
             if m_res is not None:
                 q_rn = F.normalize(qc_r.view(b, self.HKV, self.G, tc, self.HD).float(), dim=-1)
@@ -486,38 +640,49 @@ class Bolt3Attn(nn.Module):
             if tc == self.C and e < T:
                 if prev_kp is not None:
                     p_kr, p_kp, p_v, p_pos, p_b = prev_kr, prev_kp, prev_v, prev_pos, prev_b
+                    c_mask = torch.ones(b, 1, self.C, device=x.device, dtype=torch.bool)
                     if sink_k is None:
                         ns = min(self.n_sinks, p_kp.shape[2])
                         sink_k, sink_v = p_kp[:, :, :ns], p_v[:, :, :ns]
-                        p_kr, p_kp, p_v, p_pos, p_b = (
+                        c_mask[:, :, :ns] = False
+                        p_kr_t, p_kp_t, p_v_t, p_pos_t, p_b_t = (
                             p_kr[:, :, ns:],
                             p_kp[:, :, ns:],
                             p_v[:, :, ns:],
                             p_pos[:, :, ns:],
                             p_b[:, :, ns:],
                         )
-                    ak_d = ak.detach() if ak is not None else None
-                    av_d = av.detach() if av is not None else None
-                    pm_d = pm.detach() if pm is not None else None
-                    mr_d = m_res.detach() if m_res is not None else None
-                    ak, av, mass, util, pm, act, m_res, n_filled = self._consolidate_functional(
-                        ak_d,
-                        av_d,
-                        mass,
-                        util,
-                        pm_d,
-                        act,
-                        mr_d,
-                        p_kr,
-                        p_kp,
-                        p_v,
-                        p_pos,
-                        p_b,
-                        inv_freq,
-                        diag_eye,
-                        gam,
-                        n_filled=n_filled,
-                    )
+                    else:
+                        p_kr_t, p_kp_t, p_v_t, p_pos_t, p_b_t = p_kr, p_kp, p_v, p_pos, p_b
+
+                    if self.is_cold_armed and self.max_cold_blocks > 0:
+                        cold_k, cold_v, cold_m, cold_pos, cold_b, cold_kmin, cold_kmax, popped = self._push_cold_block(
+                            cold_k, cold_v, cold_m, cold_pos, cold_b, cold_kmin, cold_kmax,
+                            p_kp, p_v, c_mask, p_pos.expand(b, 1, self.C), p_b,
+                        )
+                        if popped is not None:
+                            ok_p, ok_v, ok_m, ok_pos, ok_b = popped
+                            ok_kr = apply_rope_pos(ok_p, -ok_pos.expand(b, self.HKV, self.C), inv_freq)
+                            tok_v_in = None if bool(ok_m.all()) else ok_m.expand(b, self.HKV, -1).reshape(b * self.HKV, -1)
+                            ak_d = ak.detach() if ak is not None else None
+                            av_d = av.detach() if av is not None else None
+                            pm_d = pm.detach() if pm is not None else None
+                            mr_d = m_res.detach() if m_res is not None else None
+                            ak, av, mass, util, pm, act, m_res, n_filled = self._consolidate_functional(
+                                ak_d, av_d, mass, util, pm_d, act, mr_d,
+                                ok_kr, ok_p, ok_v, ok_pos, ok_b, inv_freq, diag_eye, gam,
+                                n_filled=n_filled, tok_valid=tok_v_in,
+                            )
+                    else:
+                        ak_d = ak.detach() if ak is not None else None
+                        av_d = av.detach() if av is not None else None
+                        pm_d = pm.detach() if pm is not None else None
+                        mr_d = m_res.detach() if m_res is not None else None
+                        ak, av, mass, util, pm, act, m_res, n_filled = self._consolidate_functional(
+                            ak_d, av_d, mass, util, pm_d, act, mr_d,
+                            p_kr_t, p_kp_t, p_v_t, p_pos_t, p_b_t, inv_freq, diag_eye, gam,
+                            n_filled=n_filled,
+                        )
                 prev_kr, prev_kp, prev_v, prev_pos, prev_b = kc_r, kc_p, vc, pos_c, bc
 
         y_out = torch.cat(ys, dim=2)
@@ -546,7 +711,7 @@ def _steady_block_fast(
     m_res: torch.Tensor,
     res_scale: torch.Tensor,
 ) -> torch.Tensor:
-    """Zero-cat single-token decode step across unified `[sink | ak_eff | half0 | half1]` buffers."""
+    """Zero-cat single-token decode step across unified `[sink | ak_eff | half0 | half1 | cold]` buffers."""
     b = x.shape[0]
     h = norm1(x)
     q_r, k_r, v_n = ly.head_qkv(h)
@@ -556,16 +721,16 @@ def _steady_block_fast(
     beta_n = torch.sigmoid(ly.beta_proj(h)).transpose(1, 2)
     eta_n = torch.tanh(ly.eta_proj(h)).transpose(1, 2).unsqueeze(-1)
 
-    buf_k.index_copy_(2, slot_buf_t, k_p)
-    buf_v.index_copy_(2, slot_buf_t, v_n)
+    buf_k.index_copy_(2, slot_buf_t, k_p.to(buf_k.dtype))
+    buf_v.index_copy_(2, slot_buf_t, v_n.to(buf_v.dtype))
     mask_buf.index_copy_(3, slot_buf_t, zero_mask)
-    cur_kr.index_copy_(2, slot_cur_t, k_r)
+    cur_kr.index_copy_(2, slot_cur_t, k_r.to(cur_kr.dtype))
     cur_pos.index_copy_(2, slot_cur_t, pos_n)
-    cur_b.index_copy_(2, slot_cur_t, beta_n)
+    cur_b.index_copy_(2, slot_cur_t, beta_n.to(cur_b.dtype))
 
     qg = q_p.view(b, ly.HKV, ly.G, 1, ly.HD)
     n_tot = buf_k.shape[2]
-    if x.is_cuda:
+    if x.is_cuda and n_tot > 512:
         scores = torch.matmul(qg, buf_k.unsqueeze(2).transpose(-1, -2)).float() * (ly.HD ** -0.5)
     else:
         scores = torch.matmul(qg.float(), buf_k.float().unsqueeze(2).transpose(-1, -2)) * (ly.HD ** -0.5)
@@ -586,15 +751,23 @@ def _steady_block_fast(
 class _Bolt3GraphRunner:
     """CUDA Graph runner for steady-state (`cur_len < C`) single-token Bolt-3 decode."""
 
-    def __init__(self, model, batch_size: int, device: torch.device, dtype: torch.dtype):
+    def __init__(
+        self,
+        model,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        cold_caps: tuple[int, ...] | None = None,
+    ):
         self.model = model
         self.batch_size = batch_size
         self.device = device
         self.dtype = dtype
+        self.cold_caps = cold_caps or tuple(0 for _ in model.blocks)
         self.L = len(model.blocks)
         ly0: Bolt3Attn = model.blocks[0].attn
         self.C = ly0.C
-        self.N_tot = ly0.n_sinks + ly0.S + 2 * ly0.C
+        self.W1 = ly0.n_sinks + ly0.S + 2 * ly0.C
 
         self.states: list[torch.Tensor] = []
         self.buf_k: list[torch.Tensor] = []
@@ -606,9 +779,10 @@ class _Bolt3GraphRunner:
         self.cur_b: list[torch.Tensor] = []
         self.res_scales: list[torch.Tensor] = []
 
-        for blk in model.blocks:
+        for li, blk in enumerate(model.blocks):
             ly: Bolt3Attn = blk.attn
-            n_tot = ly.n_sinks + ly.S + 2 * ly.C
+            c_cap = self.cold_caps[li]
+            n_tot = ly.n_sinks + ly.S + 2 * ly.C + c_cap * ly.C
             self.states.append(torch.zeros(batch_size, ly.HKV, ly.HD, ly.HD, device=device, dtype=torch.float32))
             self.buf_k.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
             self.buf_v.append(torch.zeros(batch_size, ly.HKV, n_tot, ly.HD, device=device, dtype=dtype))
@@ -625,11 +799,12 @@ class _Bolt3GraphRunner:
         self.g_slot_cur = torch.zeros(1, device=device, dtype=torch.long)
         self.g_zero_mask = torch.zeros(batch_size, ly0.HKV, 1, 1, device=device, dtype=torch.float32)
         self.g_out_h = torch.zeros(batch_size, 1, int(model.config["dim"]), device=device, dtype=dtype)
-        self.slot_idxs = [torch.tensor([i], device=device, dtype=torch.long) for i in range(max(self.N_tot, self.C))]
+        self.slot_idxs = [torch.tensor([i], device=device, dtype=torch.long) for i in range(max(self.W1, self.C))]
         self.inv_freq = ly0.rope.inv_freq.to(device)
+        use_bf16_auto = dtype == torch.bfloat16
 
         def _forward_steady():
-            with torch.autocast("cuda", torch.bfloat16, enabled=True):
+            with torch.autocast("cuda", torch.bfloat16, enabled=use_bf16_auto):
                 x = self.model.embed_tokens(self.g_tok)
                 freqs = self.g_pos.unsqueeze(-1) * self.inv_freq.view(1, 1, 1, -1)
                 emb = torch.cat((freqs, freqs), dim=-1)
@@ -670,6 +845,23 @@ class _Bolt3GraphRunner:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self.g_out_h.copy_(_forward_steady())
+
+    def close(self):
+        self.graph = None
+        for lst in (
+            self.states,
+            self.buf_k,
+            self.buf_v,
+            self.mask_buf,
+            self.util_acc,
+            self.cur_kr,
+            self.cur_pos,
+            self.cur_b,
+            self.res_scales,
+            self.slot_idxs,
+        ):
+            lst.clear()
+        self.model = None
 
     @torch.no_grad()
     def replay(
@@ -721,6 +913,8 @@ class Bolt3Decoder:
                     + 6 * ly.C * ly.HKV * ly.HD * 2
                     + 2 * ly.n_sinks * ly.HKV * ly.HD * 2
                 )
+                if ly.is_cold_armed and ly.max_cold_blocks > 0:
+                    per_tok += 2 * ly.HKV * ly.HD * 2
             else:
                 per_tok += 2 * ly.HKV * ly.HD * 2
         return flat, per_tok
@@ -735,7 +929,12 @@ class Bolt3Decoder:
         **kwargs,
     ):
         states, kv_caches = [None] * len(model.blocks), [None] * len(model.blocks)
-        dt = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+        emb_dt = model.embed_tokens.weight.dtype
+        dt = (
+            emb_dt
+            if emb_dt in (torch.bfloat16, torch.float16, torch.float32)
+            else (torch.bfloat16 if str(device).startswith("cuda") else torch.float32)
+        )
         for li, blk in enumerate(model.blocks):
             ly = blk.attn
             if isinstance(ly, Bolt3Attn):
@@ -771,6 +970,14 @@ class Bolt3Decoder:
                     "cur_valid": None,
                     "cur_has_pad": False,
                     "cur_len": 0,
+                    "cold_k_blk": None,
+                    "cold_v_blk": None,
+                    "cold_mask": None,
+                    "cold_pos": None,
+                    "cold_b": None,
+                    "cold_kmin": None,
+                    "cold_kmax": None,
+                    "cold_cap_blks": 0,
                     "buf_k": None,
                     "buf_v": None,
                     "mask_buf": None,
@@ -790,7 +997,7 @@ class Bolt3Decoder:
         for c in kv_caches:
             if isinstance(c, dict):
                 for k in list(c.keys()):
-                    if k in ("n_filled", "cur_len", "cur_half"):
+                    if k in ("n_filled", "cur_len", "cur_half", "cold_cap_blks"):
                         c[k] = 0
                     elif k in ("prev_has_pad", "cur_has_pad", "has_prev"):
                         c[k] = False
@@ -798,6 +1005,26 @@ class Bolt3Decoder:
                         c[k] = None
             elif isinstance(c, StaticKV):
                 c.n = 0
+
+    def close(self):
+        runners = getattr(self, "_graph_runners", None)
+        if runners:
+            for r in list(runners.values()):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            runners.clear()
+        for attr in ("_diag_eye_cache", "_gam_cache", "_slot_t_cache", "_zero_m_cache"):
+            d = getattr(self, attr, None)
+            if isinstance(d, dict):
+                d.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _sample(
@@ -863,18 +1090,33 @@ class Bolt3Decoder:
             self._zero_m_cache[key] = zm
         return zm
 
+    @staticmethod
+    def _cold_cap_for(ly: Bolt3Attn, sc: dict | None) -> int:
+        if not (ly.is_cold_armed and ly.max_cold_blocks > 0 and ly.cold_topk == 0):
+            return 0
+        ck = sc.get("cold_k_blk") if isinstance(sc, dict) else None
+        n_cb = int(ck.shape[2]) if ck is not None else 0
+        if n_cb <= 0:
+            return 0
+        cap = 16 if n_cb <= 16 else (1 << (n_cb - 1).bit_length())
+        return min(ly.max_cold_blocks, cap)
+
     def _sync_unified_bufs(self, sc: dict, ly: Bolt3Attn, b: int, device: torch.device, dt: torch.dtype):
+        cold_cap_blks = self._cold_cap_for(ly, sc)
         sig = (
             id(sc.get("buf_k")),
             id(sc.get("sink_k")),
             id(sc.get("prev_kp")),
             id(sc.get("ak")),
             id(sc.get("cur_kp")),
+            cold_cap_blks,
+            id(sc.get("cold_k_blk")),
         )
         if sc.get("buf_k") is not None and sc.get("_synced_ids") == sig:
             return
         w0 = ly.n_sinks + ly.S
-        n_tot = w0 + 2 * ly.C
+        w1 = w0 + 2 * ly.C
+        n_tot = w1 + cold_cap_blks * ly.C
         inv_freq = ly.rope.inv_freq.to(device)
         buf_k = sc.get("buf_k")
         if buf_k is None or buf_k.shape != (b, ly.HKV, n_tot, ly.HD) or buf_k.dtype != dt or buf_k.device != device:
@@ -927,7 +1169,7 @@ class Bolt3Decoder:
             sc["has_prev"] = False
 
         cl = int(sc.get("cur_len", 0))
-        if sc.get("cur_kr") is None or sc["cur_kr"].shape != (b, ly.HKV, ly.C, ly.HD):
+        if sc.get("cur_kr") is None or sc["cur_kr"].shape != (b, ly.HKV, ly.C, ly.HD) or sc["cur_kr"].dtype != dt:
             sc["cur_kr"] = torch.empty(b, ly.HKV, ly.C, ly.HD, device=device, dtype=dt)
             sc["cur_pos"] = torch.zeros(b, 1, ly.C, device=device, dtype=torch.float32)
             sc["cur_b"] = torch.empty(b, ly.HKV, ly.C, device=device, dtype=dt)
@@ -942,6 +1184,15 @@ class Bolt3Decoder:
                 mask_buf[:, :, :, c_lo : c_lo + cl] = 0.0
         sc["cur_kp"] = buf_k[:, :, c_lo : c_lo + ly.C]
         sc["cur_v"] = buf_v[:, :, c_lo : c_lo + ly.C]
+
+        if cold_cap_blks > 0 and sc.get("cold_k_blk") is not None:
+            n_tok_c = int(sc["cold_k_blk"].shape[2]) * ly.C
+            buf_k[:, :, w1 : w1 + n_tok_c] = sc["cold_k_blk"].reshape(b, ly.HKV, n_tok_c, ly.HD).to(device=device, dtype=dt)
+            buf_v[:, :, w1 : w1 + n_tok_c] = sc["cold_v_blk"].reshape(b, ly.HKV, n_tok_c, ly.HD).to(device=device, dtype=dt)
+            cm = sc["cold_mask"].reshape(b, 1, 1, n_tok_c).expand(b, ly.HKV, 1, n_tok_c)
+            mask_buf[:, :, :, w1 : w1 + n_tok_c] = torch.where(cm, 0.0, float("-inf"))
+
+        sc["cold_cap_blks"] = cold_cap_blks
         sc["buf_k"], sc["buf_v"], sc["mask_buf"] = buf_k, buf_v, mask_buf
         sc["_synced_ids"] = (
             id(buf_k),
@@ -949,6 +1200,8 @@ class Bolt3Decoder:
             id(sc.get("prev_kp")),
             id(sc.get("ak")),
             id(sc.get("cur_kp")),
+            cold_cap_blks,
+            id(sc.get("cold_k_blk")),
         )
 
     def _consolidate_layer(
@@ -968,6 +1221,7 @@ class Bolt3Decoder:
             sc["util_acc"].zero_()
 
         has_prev = sc.get("has_prev", False) if unified else (sc["prev_kp"] is not None)
+        cold_bucket_ok = True
         if has_prev:
             if unified:
                 prev_half = 1 - int(sc.get("cur_half", 0))
@@ -985,6 +1239,7 @@ class Bolt3Decoder:
                     sc["prev_valid"],
                 )
 
+            p_kp_f, p_v_f, p_pos_f, p_b_f = p_kp, p_v, p_pos, p_b
             all_valid_prev = bool(p_val.all())
             if sc["sink_k"] is None and all_valid_prev:
                 ns = min(ly.n_sinks, p_kp.shape[2])
@@ -992,6 +1247,8 @@ class Bolt3Decoder:
                 sc["sink_v"] = p_v[:, :, :ns].clone()
                 sc["sink_valid"] = torch.ones(b, 1, ns, device=device, dtype=torch.bool)
                 sc["sink_filled"] = torch.full((b,), ns, device=device, dtype=torch.long)
+                c_mask_f = torch.ones(b, 1, p_kp.shape[2], device=device, dtype=torch.bool)
+                c_mask_f[:, :, :ns] = False
                 p_kr, p_kp, p_v, p_pos, p_b = (
                     p_kr[:, :, ns:],
                     p_kp[:, :, ns:],
@@ -1025,40 +1282,104 @@ class Bolt3Decoder:
                             sc["sink_valid"][r, 0, sf : sf + take] = True
                             sc["sink_filled"][r] = sf + take
                             p_val_work[r, 0, sel] = False
+                c_mask_f = p_val_work
                 tok_valid_in = p_val_work.expand(b, ly.HKV, -1).reshape(b * ly.HKV, -1)
             elif sc["act"] is not None and not bool(sc["act"].all()):
+                c_mask_f = torch.ones(b, 1, p_kp.shape[2], device=device, dtype=torch.bool)
                 tok_valid_in = torch.ones(b * ly.HKV, p_kp.shape[2], device=device, dtype=torch.bool)
             else:
+                c_mask_f = torch.ones(b, 1, p_kp.shape[2], device=device, dtype=torch.bool)
                 tok_valid_in = None
 
-            eye = self._diag_eye_cache.get(device)
-            if eye is None:
-                eye = torch.eye(ly.S, device=device, dtype=torch.bool).unsqueeze(0)
-                self._diag_eye_cache[device] = eye
-            m_in = states[li].view(b * ly.HKV, ly.HD, ly.HD)
-            sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_out, sc["n_filled"] = (
-                ly._consolidate_functional(
-                    sc["ak"],
-                    sc["av"],
-                    sc["mass"],
-                    sc["util"],
-                    sc["pm"],
-                    sc["act"],
-                    m_in,
-                    p_kr,
-                    p_kp,
-                    p_v,
-                    p_pos,
-                    p_b,
-                    inv_freq,
-                    eye,
-                    gam,
-                    n_filled=sc.get("n_filled", 0),
-                    tok_valid=tok_valid_in,
+            if ly.is_cold_armed and ly.max_cold_blocks > 0:
+                (
+                    sc["cold_k_blk"],
+                    sc["cold_v_blk"],
+                    sc["cold_mask"],
+                    sc["cold_pos"],
+                    sc["cold_b"],
+                    sc["cold_kmin"],
+                    sc["cold_kmax"],
+                    popped,
+                ) = ly._push_cold_block(
+                    sc.get("cold_k_blk"),
+                    sc.get("cold_v_blk"),
+                    sc.get("cold_mask"),
+                    sc.get("cold_pos"),
+                    sc.get("cold_b"),
+                    sc.get("cold_kmin"),
+                    sc.get("cold_kmax"),
+                    p_kp_f,
+                    p_v_f,
+                    c_mask_f,
+                    p_pos_f,
+                    p_b_f,
                 )
-            )
-            states[li].copy_(m_out.view(b, ly.HKV, ly.HD, ly.HD))
-            self._refresh_attractor_cache(sc, ly, b, inv_freq)
+                if popped is not None:
+                    ok_p, ok_v, ok_m, ok_pos, ok_b = popped
+                    ok_kr = apply_rope_pos(ok_p, -ok_pos.expand(b, ly.HKV, ly.C), inv_freq)
+                    tok_valid_pop = (
+                        ok_m.expand(b, ly.HKV, -1).reshape(b * ly.HKV, -1)
+                        if ((sc["act"] is not None and not bool(sc["act"].all())) or not bool(ok_m.all()))
+                        else None
+                    )
+                    eye = self._diag_eye_cache.get(device)
+                    if eye is None:
+                        eye = torch.eye(ly.S, device=device, dtype=torch.bool).unsqueeze(0)
+                        self._diag_eye_cache[device] = eye
+                    m_in = states[li].view(b * ly.HKV, ly.HD, ly.HD)
+                    sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_out, sc["n_filled"] = (
+                        ly._consolidate_functional(
+                            sc["ak"],
+                            sc["av"],
+                            sc["mass"],
+                            sc["util"],
+                            sc["pm"],
+                            sc["act"],
+                            m_in,
+                            ok_kr,
+                            ok_p,
+                            ok_v,
+                            ok_pos,
+                            ok_b,
+                            inv_freq,
+                            eye,
+                            gam,
+                            n_filled=sc.get("n_filled", 0),
+                            tok_valid=tok_valid_pop,
+                        )
+                    )
+                    states[li].copy_(m_out.view(b, ly.HKV, ly.HD, ly.HD))
+                    self._refresh_attractor_cache(sc, ly, b, inv_freq)
+            else:
+                eye = self._diag_eye_cache.get(device)
+                if eye is None:
+                    eye = torch.eye(ly.S, device=device, dtype=torch.bool).unsqueeze(0)
+                    self._diag_eye_cache[device] = eye
+                m_in = states[li].view(b * ly.HKV, ly.HD, ly.HD)
+                sc["ak"], sc["av"], sc["mass"], sc["util"], sc["pm"], sc["act"], m_out, sc["n_filled"] = (
+                    ly._consolidate_functional(
+                        sc["ak"],
+                        sc["av"],
+                        sc["mass"],
+                        sc["util"],
+                        sc["pm"],
+                        sc["act"],
+                        m_in,
+                        p_kr,
+                        p_kp,
+                        p_v,
+                        p_pos,
+                        p_b,
+                        inv_freq,
+                        eye,
+                        gam,
+                        n_filled=sc.get("n_filled", 0),
+                        tok_valid=tok_valid_in,
+                    )
+                )
+                states[li].copy_(m_out.view(b, ly.HKV, ly.HD, ly.HD))
+                self._refresh_attractor_cache(sc, ly, b, inv_freq)
 
             if unified:
                 ns = sc["sink_k"].shape[2]
@@ -1070,9 +1391,21 @@ class Bolt3Decoder:
                     sc["mask_buf"][:, :, :, :ns] = torch.where(sv, 0.0, float("-inf"))
                 else:
                     sc["mask_buf"][:, :, :, :ns] = 0.0
-                sc["buf_k"][:, :, ly.n_sinks : w0] = sc["ak_eff"]
-                sc["buf_v"][:, :, ly.n_sinks : w0] = sc["av"].view(b, ly.HKV, ly.S, ly.HD)
-                sc["mask_buf"][:, :, :, ly.n_sinks : w0] = sc["att_bias"].view(b, ly.HKV, 1, ly.S)
+                if sc["ak"] is not None:
+                    sc["buf_k"][:, :, ly.n_sinks : w0] = sc["ak_eff"]
+                    sc["buf_v"][:, :, ly.n_sinks : w0] = sc["av"].view(b, ly.HKV, ly.S, ly.HD)
+                    sc["mask_buf"][:, :, :, ly.n_sinks : w0] = sc["att_bias"].view(b, ly.HKV, 1, ly.S)
+                if ly.is_cold_armed and ly.max_cold_blocks > 0 and ly.cold_topk == 0:
+                    new_cap = self._cold_cap_for(ly, sc)
+                    if new_cap != sc.get("cold_cap_blks", 0):
+                        cold_bucket_ok = False
+                    elif new_cap > 0 and sc.get("cold_k_blk") is not None:
+                        w1 = w0 + 2 * ly.C
+                        n_tok_c = int(sc["cold_k_blk"].shape[2]) * ly.C
+                        sc["buf_k"][:, :, w1 : w1 + n_tok_c] = sc["cold_k_blk"].reshape(b, ly.HKV, n_tok_c, ly.HD)
+                        sc["buf_v"][:, :, w1 : w1 + n_tok_c] = sc["cold_v_blk"].reshape(b, ly.HKV, n_tok_c, ly.HD)
+                        cm = sc["cold_mask"].reshape(b, 1, 1, n_tok_c).expand(b, ly.HKV, 1, n_tok_c)
+                        sc["mask_buf"][:, :, :, w1 : w1 + n_tok_c] = torch.where(cm, 0.0, float("-inf"))
 
         if unified:
             if sc["prev_kr"] is None or sc["prev_kr"].shape != sc["cur_kr"].shape:
@@ -1098,13 +1431,30 @@ class Bolt3Decoder:
             sc["cur_valid"].fill_(True)
             sc["prev_has_pad"], sc["cur_has_pad"] = sc.get("cur_has_pad", False), False
             sc["cur_len"] = 0
-            sc["_synced_ids"] = (
-                id(sc["buf_k"]),
-                id(sc.get("sink_k")),
-                id(sc.get("prev_kp")),
-                id(sc.get("ak")),
-                id(sc.get("cur_kp")),
-            )
+            if cold_bucket_ok:
+                sc["_synced_ids"] = (
+                    id(sc["buf_k"]),
+                    id(sc.get("sink_k")),
+                    id(sc.get("prev_kp")),
+                    id(sc.get("ak")),
+                    id(sc.get("cur_kp")),
+                    sc.get("cold_cap_blks", 0),
+                    id(sc.get("cold_k_blk")),
+                )
+                if sc.get("_runner_id") is not None:
+                    sc["_runner_id"] = (
+                        sc["_runner_id"][0],
+                        id(states[li]),
+                        id(sc["buf_k"]),
+                        id(sc.get("sink_k")),
+                        id(sc.get("ak")),
+                        id(sc.get("prev_kp")),
+                        sc.get("cold_cap_blks", 0),
+                        id(sc.get("cold_k_blk")),
+                    )
+            else:
+                sc["_synced_ids"] = None
+                sc["_runner_id"] = None
         else:
             sc["prev_kr"], sc["cur_kr"] = sc["cur_kr"], sc["prev_kr"]
             sc["prev_kp"], sc["cur_kp"] = sc["cur_kp"], sc["prev_kp"]
@@ -1116,8 +1466,10 @@ class Bolt3Decoder:
                 sc["cur_valid"].fill_(True)
             sc["prev_has_pad"], sc["cur_has_pad"] = sc.get("cur_has_pad", False), False
             sc["cur_len"] = 0
+            sc["cold_cap_blks"] = 0
             sc["buf_k"] = None
             sc["_synced_ids"] = None
+            sc["_runner_id"] = None
 
     def step_block(
         self,
@@ -1141,7 +1493,7 @@ class Bolt3Decoder:
             gam, res_scale = self._get_gam_scale(ly, device)
 
             # Fast zero-cat unified buffer path for unpadded single-token decode steps
-            if t_s == 1 and valid_mask is None:
+            if t_s == 1 and valid_mask is None and not (ly.is_cold_armed and ly.max_cold_blocks > 0 and ly.cold_topk > 0):
                 self._sync_unified_bufs(sc, ly, b, device, x.dtype)
                 if _rope_cs is None:
                     if pos_ids is None:
@@ -1287,13 +1639,21 @@ class Bolt3Decoder:
 
             sp.append(s_loc)
             vp.append(loc_v)
-            scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
-            v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
-            probs = F.softmax(scores, dim=-1)
+            att_off = sc["sink_k"].shape[2] if sc["sink_k"] is not None else 0
+            att_slice = (att_off, att_off + ly.S) if sc["ak"] is not None else None
+            y, att_p = ly._attend_with_cold(
+                qg,
+                sp,
+                vp,
+                sc.get("cold_k_blk"),
+                sc.get("cold_v_blk"),
+                sc.get("cold_mask"),
+                sc.get("cold_kmin"),
+                sc.get("cold_kmax"),
+                att_slice=att_slice,
+            )
 
-            if sc["ak"] is not None:
-                att_off = sc["sink_k"].shape[2] if sc["sink_k"] is not None else 0
-                att_p = probs[..., att_off : att_off + ly.S]
+            if sc["ak"] is not None and att_p is not None:
                 if valid_mask is not None:
                     att_p = att_p * valid_mask.view(b, 1, 1, t_s, 1).float()
                 att_sum = att_p.mean(dim=2).sum(dim=2).reshape(b * ly.HKV, ly.S)
@@ -1301,8 +1661,6 @@ class Bolt3Decoder:
                     sc["util_acc"] = att_sum
                 else:
                     sc["util_acc"] = sc["util_acc"] + att_sum
-
-            y = torch.matmul(probs.to(v_cat.dtype), v_cat.unsqueeze(2)).reshape(b, ly.H, t_s, ly.HD)
 
             if states[li] is not None:
                 q_rn = F.normalize(q_r.view(b, ly.HKV, ly.G, t_s, ly.HD).float(), dim=-1)
@@ -1343,32 +1701,52 @@ class Bolt3Decoder:
 
         return x + blk.mlp(blk.norm2(x))
 
-    def _can_use_graph(self, tokens: torch.Tensor, valid_mask, kv_caches) -> bool:
+    def _can_use_graph(
+        self, tokens: torch.Tensor, valid_mask, kv_caches, dtype: torch.dtype, cold_caps: tuple[int, ...]
+    ) -> bool:
         if not (tokens.is_cuda and tokens.shape[1] == 1 and valid_mask is None and self.use_cuda_graph):
             return False
         if not (self._all_bolt3 and self._shared_rope and len(kv_caches) == len(self.model.blocks)):
+            return False
+        if any(blk.attn.is_cold_armed and blk.attn.max_cold_blocks > 0 and blk.attn.cold_topk > 0 for blk in self.model.blocks):
             return False
         b = tokens.shape[0]
         if b == 1:
             return True
         if b > 64:
             return False
-        key = (b, str(tokens.device))
+        key = (b, str(tokens.device), dtype, cold_caps)
         if key in self._graph_runners:
             return True
         try:
             free_b, _ = torch.cuda.mem_get_info(tokens.device)
-            return free_b >= (b * 128 + 2048) * 1024 * 1024
+            cold_mb = sum(
+                b * cap * blk.attn.C * blk.attn.HKV * blk.attn.HD * 5 // (1024 * 1024)
+                for cap, blk in zip(cold_caps, self.model.blocks)
+                if cap > 0
+            )
+            return free_b >= (b * 128 + cold_mb + 2048) * 1024 * 1024
         except Exception:
             return False
 
-    def _get_graph_runner(self, b: int, device: torch.device, dtype: torch.dtype) -> _Bolt3GraphRunner:
-        key = (b, str(device))
+    def _get_graph_runner(
+        self, b: int, device: torch.device, dtype: torch.dtype, cold_caps: tuple[int, ...]
+    ) -> _Bolt3GraphRunner:
+        key = (b, str(device), dtype, cold_caps)
         runner = self._graph_runners.get(key)
         if runner is None:
-            for k_old in [k for k in list(self._graph_runners.keys()) if k[0] != 1 and k != key]:
-                del self._graph_runners[k_old]
-            runner = _Bolt3GraphRunner(self.model, b, device, dtype)
+            dropped = False
+            for k_old in list(self._graph_runners.keys()):
+                drop_batch = (b > 1 and k_old[0] != 1 and k_old != key)
+                drop_cold_b1 = (b == 1 and any(cold_caps) and k_old[0] == 1 and any(k_old[3]) and k_old != key)
+                if drop_batch or drop_cold_b1:
+                    r_old = self._graph_runners.pop(k_old)
+                    r_old.close()
+                    del r_old
+                    dropped = True
+            if dropped and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            runner = _Bolt3GraphRunner(self.model, b, device, dtype, cold_caps=cold_caps)
             self._graph_runners[key] = runner
         return runner
 
@@ -1386,6 +1764,7 @@ class Bolt3Decoder:
         for li, blk in enumerate(dec.model.blocks):
             sc = kv_caches[li]
             ly: Bolt3Attn = blk.attn
+            cold_cap = runner.cold_caps[li]
             expected_sig = (
                 rid,
                 id(states[li]),
@@ -1393,27 +1772,33 @@ class Bolt3Decoder:
                 id(sc.get("sink_k")),
                 id(sc.get("ak")),
                 id(sc.get("prev_kp")),
+                cold_cap,
+                id(sc.get("cold_k_blk")),
             )
             if sc.get("_runner_id") == expected_sig:
                 continue
             dec._sync_unified_bufs(sc, ly, b, device, dt)
-            runner.states[li].copy_(states[li])
-            runner.buf_k[li].copy_(sc["buf_k"])
-            runner.buf_v[li].copy_(sc["buf_v"])
-            runner.mask_buf[li].copy_(sc["mask_buf"])
-            runner.util_acc[li].copy_(sc["util_acc"])
-            runner.cur_kr[li].copy_(sc["cur_kr"])
-            runner.cur_pos[li].copy_(sc["cur_pos"])
-            runner.cur_b[li].copy_(sc["cur_b"])
+            if runner.states[li] is not states[li]:
+                runner.states[li].copy_(states[li])
+                states[li] = runner.states[li]
+            if runner.buf_k[li] is not sc["buf_k"]:
+                runner.buf_k[li].copy_(sc["buf_k"])
+                runner.buf_v[li].copy_(sc["buf_v"])
+                runner.mask_buf[li].copy_(sc["mask_buf"])
+                sc["buf_k"] = runner.buf_k[li]
+                sc["buf_v"] = runner.buf_v[li]
+                sc["mask_buf"] = runner.mask_buf[li]
+            if runner.util_acc[li] is not sc["util_acc"]:
+                runner.util_acc[li].copy_(sc["util_acc"])
+                sc["util_acc"] = runner.util_acc[li]
+            if runner.cur_kr[li] is not sc["cur_kr"]:
+                runner.cur_kr[li].copy_(sc["cur_kr"])
+                runner.cur_pos[li].copy_(sc["cur_pos"])
+                runner.cur_b[li].copy_(sc["cur_b"])
+                sc["cur_kr"] = runner.cur_kr[li]
+                sc["cur_pos"] = runner.cur_pos[li]
+                sc["cur_b"] = runner.cur_b[li]
 
-            states[li] = runner.states[li]
-            sc["buf_k"] = runner.buf_k[li]
-            sc["buf_v"] = runner.buf_v[li]
-            sc["mask_buf"] = runner.mask_buf[li]
-            sc["util_acc"] = runner.util_acc[li]
-            sc["cur_kr"] = runner.cur_kr[li]
-            sc["cur_pos"] = runner.cur_pos[li]
-            sc["cur_b"] = runner.cur_b[li]
             w0 = ly.n_sinks + ly.S
             cur_half = int(sc.get("cur_half", 0))
             p_lo = w0 + (1 - cur_half) * ly.C
@@ -1429,6 +1814,8 @@ class Bolt3Decoder:
                 id(sc.get("prev_kp")),
                 id(sc.get("ak")),
                 id(sc.get("cur_kp")),
+                cold_cap,
+                id(sc.get("cold_k_blk")),
             )
             sc["_runner_id"] = (
                 rid,
@@ -1437,6 +1824,8 @@ class Bolt3Decoder:
                 id(sc.get("sink_k")),
                 id(sc.get("ak")),
                 id(sc.get("prev_kp")),
+                cold_cap,
+                id(sc.get("cold_k_blk")),
             )
 
     @torch.no_grad()
@@ -1451,14 +1840,28 @@ class Bolt3Decoder:
     ):
         m = self.model
         t_tot = tokens.shape[1]
+        emb_dt = m.embed_tokens.weight.dtype
+        use_bf16 = tokens.is_cuda and emb_dt == torch.bfloat16
+        dt = (
+            emb_dt
+            if (tokens.is_cuda and emb_dt in (torch.bfloat16, torch.float16, torch.float32))
+            else (torch.bfloat16 if tokens.is_cuda else torch.float32)
+        )
         if t_tot == 1:
             b = tokens.shape[0]
-            dt = torch.bfloat16 if tokens.is_cuda else torch.float32
-            if self._can_use_graph(tokens, valid_mask, kv_caches):
+            cold_caps = (
+                tuple(
+                    self._cold_cap_for(blk.attn, kv_caches[li]) if isinstance(kv_caches[li], dict) else 0
+                    for li, blk in enumerate(m.blocks)
+                )
+                if len(kv_caches) == len(m.blocks)
+                else ()
+            )
+            if self._can_use_graph(tokens, valid_mask, kv_caches, dt, cold_caps):
                 len0 = int(kv_caches[0].get("cur_len", 0))
                 half0 = int(kv_caches[0].get("cur_half", 0))
                 if all(c.get("cur_len", 0) == len0 and c.get("cur_half", 0) == half0 for c in kv_caches):
-                    runner = self._get_graph_runner(b, tokens.device, dt)
+                    runner = self._get_graph_runner(b, tokens.device, dt, cold_caps)
                     self._bind_graph_state(self, runner, states, kv_caches, b, tokens.device, dt)
                     ly0: Bolt3Attn = m.blocks[0].attn
                     slot_buf = ly0.n_sinks + ly0.S + half0 * ly0.C + len0
@@ -1474,7 +1877,7 @@ class Bolt3Decoder:
                             self._consolidate_layer(li, ly, kv_caches[li], states, b, tokens.device, inv_freq, gam, unified=True)
                     return out_h, states, kv_caches
 
-            with torch.autocast("cuda", torch.bfloat16, enabled=tokens.is_cuda):
+            with torch.autocast("cuda", torch.bfloat16, enabled=use_bf16):
                 x = m.embed_tokens(tokens)
                 rope_cs = None
                 if self._shared_rope:
@@ -1497,7 +1900,7 @@ class Bolt3Decoder:
             take = min(t_tot - s, self.C - cur_len)
             p_slice = pos_ids[:, s : s + take] if pos_ids is not None else None
             v_slice = valid_mask[:, s : s + take] if valid_mask is not None else None
-            with torch.autocast("cuda", torch.bfloat16, enabled=tokens.is_cuda):
+            with torch.autocast("cuda", torch.bfloat16, enabled=use_bf16):
                 x = m.embed_tokens(tokens[:, s : s + take])
                 rope_cs = None
                 if self._shared_rope:

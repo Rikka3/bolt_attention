@@ -432,23 +432,26 @@ def run_hubcheck(
         ("server", lambda: check_server(stu, tok, device, prof)),
     ]
     res = {"checkpoint": ckpt_path, "donor": donor_id, "profile": prof.name, "checks": {}}
-    for name, fn in checks:
-        if name in skip:
-            continue
-        print(f"  [{name}] ...", flush=True)
-        t0 = time.perf_counter()
-        try:
-            r = fn()
-        except Exception as e:
-            r = {"pass": False, "error": f"{type(e).__name__}: {e}"}
-        r["secs"] = round(time.perf_counter() - t0, 1)
-        res["checks"][name] = r
-        detail = {k: v for k, v in r.items() if k not in ("pass", "rows", "runs", "eos_ids")}
-        print(f"  [{name}] {'PASS' if r['pass'] else 'FAIL'}  {json.dumps(detail, default=str)[:1500]}", flush=True)
-        for row in r.get("rows", []):
-            print(f"      {json.dumps(row, default=str)[:300]}", flush=True)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    try:
+        for name, fn in checks:
+            if name in skip:
+                continue
+            print(f"  [{name}] ...", flush=True)
+            t0 = time.perf_counter()
+            try:
+                r = fn()
+            except Exception as e:
+                r = {"pass": False, "error": f"{type(e).__name__}: {e}"}
+            r["secs"] = round(time.perf_counter() - t0, 1)
+            res["checks"][name] = r
+            detail = {k: v for k, v in r.items() if k not in ("pass", "rows", "runs", "eos_ids")}
+            print(f"  [{name}] {'PASS' if r['pass'] else 'FAIL'}  {json.dumps(detail, default=str)[:1500]}", flush=True)
+            for row in r.get("rows", []):
+                print(f"      {json.dumps(row, default=str)[:300]}", flush=True)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    finally:
+        dec.close()
 
     res["ready"] = all(c["pass"] for c in res["checks"].values())
     print("-" * 84)

@@ -408,6 +408,53 @@ def _eval_model(
         else (tok.eos_token_id if isinstance(tok.eos_token_id, int) else 0)
     )
 
+    try:
+        return _eval_model_body(
+            model,
+            is_hf,
+            tok,
+            device,
+            limit,
+            gsm8k_limit,
+            out,
+            eos_ids,
+            dec,
+            log_dir,
+            has_think_vocab,
+            close_toks,
+            gen_bs,
+            mc_bs,
+            pad_id,
+            on_save,
+            gsm_max_new,
+            tasks_filter,
+        )
+    finally:
+        if dec is not None:
+            dec.close()
+
+
+def _eval_model_body(
+    model,
+    is_hf: bool,
+    tok,
+    device: torch.device,
+    limit: int,
+    gsm8k_limit: int,
+    out: dict,
+    eos_ids: set[int],
+    dec,
+    log_dir: str,
+    has_think_vocab: bool,
+    close_toks: list[int],
+    gen_bs: int,
+    mc_bs: int,
+    pad_id: int,
+    on_save,
+    gsm_max_new: int,
+    tasks_filter: set[str] | None,
+) -> dict:
+
     def _want(name: str) -> bool:
         return not tasks_filter or name.lower() in tasks_filter
 
@@ -740,87 +787,104 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
     scaling = []
     dec_stu = Bolt3Decoder(stu, max_cache_pos=70000)
 
-    for T_c in ctx_lengths:
-        nxt_tok = torch.tensor([[100]], device=device, dtype=torch.long)
+    try:
+        for T_c in ctx_lengths:
+            nxt_tok = torch.tensor([[100]], device=device, dtype=torch.long)
 
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        base_mem_stu = torch.cuda.memory_allocated()
-        states_s, kv_s = dec_stu.blank_state(stu, 1, device, max_kv_len=T_c + gen_steps + 32)
-        for li, blk in enumerate(stu.blocks):
-            ly = blk.attn
-            kv_s[li]["sink_k"] = torch.randn(1, ly.HKV, ly.n_sinks, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-            kv_s[li]["sink_v"] = torch.randn_like(kv_s[li]["sink_k"])
-            kv_s[li]["sink_valid"] = torch.ones(1, 1, ly.n_sinks, device=device, dtype=torch.bool)
-            kv_s[li]["sink_filled"] = torch.full((1,), ly.n_sinks, device=device, dtype=torch.long)
-            kv_s[li]["prev_kr"] = torch.randn(1, ly.HKV, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-            kv_s[li]["prev_kp"] = torch.randn_like(kv_s[li]["prev_kr"])
-            kv_s[li]["prev_v"] = torch.randn_like(kv_s[li]["prev_kr"])
-            kv_s[li]["prev_pos"] = torch.arange(T_c - ly.C, T_c, device=device, dtype=torch.float32).view(1, 1, ly.C)
-            kv_s[li]["prev_b"] = torch.full((1, ly.HKV, ly.C), 0.25, device=device, dtype=torch.bfloat16)
-            kv_s[li]["prev_valid"] = torch.ones(1, 1, ly.C, device=device, dtype=torch.bool)
-            kv_s[li]["ak"] = torch.randn(ly.HKV, ly.S, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-            kv_s[li]["av"] = torch.randn_like(kv_s[li]["ak"])
-            kv_s[li]["mass"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32)
-            kv_s[li]["util"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32) * 0.2
-            kv_s[li]["util_acc"] = torch.zeros(ly.HKV, ly.S, device=device, dtype=torch.float32)
-            kv_s[li]["pm"] = torch.arange(ly.S, device=device, dtype=torch.float32).unsqueeze(0).expand(ly.HKV, -1).clone()
-            kv_s[li]["act"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.bool)
-            kv_s[li]["n_filled"] = ly.S
-        bolt3_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
-
-        dec_stu.step(nxt_tok, T_c, states_s, kv_s)
-        torch.cuda.synchronize()
-        runs_s = []
-        for _ in range(3):
-            t0 = time.perf_counter()
-            for step_i in range(gen_steps):
-                x_h, states_s, kv_s = dec_stu.step(nxt_tok, T_c + step_i, states_s, kv_s)
-                _ = stu.lm_head(x_h[:, -1, :]).argmax(-1)
             torch.cuda.synchronize()
-            runs_s.append(gen_steps / (time.perf_counter() - t0))
-        bolt3_tok_s = statistics.median(runs_s)
-        del states_s, kv_s
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
+            base_mem_stu = torch.cuda.memory_allocated()
+            states_s, kv_s = dec_stu.blank_state(stu, 1, device, max_kv_len=T_c + gen_steps + 32)
+            for li, blk in enumerate(stu.blocks):
+                ly = blk.attn
+                kv_s[li]["sink_k"] = torch.randn(1, ly.HKV, ly.n_sinks, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+                kv_s[li]["sink_v"] = torch.randn_like(kv_s[li]["sink_k"])
+                kv_s[li]["sink_valid"] = torch.ones(1, 1, ly.n_sinks, device=device, dtype=torch.bool)
+                kv_s[li]["sink_filled"] = torch.full((1,), ly.n_sinks, device=device, dtype=torch.long)
+                kv_s[li]["prev_kr"] = torch.randn(1, ly.HKV, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+                kv_s[li]["prev_kp"] = torch.randn_like(kv_s[li]["prev_kr"])
+                kv_s[li]["prev_v"] = torch.randn_like(kv_s[li]["prev_kr"])
+                kv_s[li]["prev_pos"] = torch.arange(T_c - ly.C, T_c, device=device, dtype=torch.float32).view(1, 1, ly.C)
+                kv_s[li]["prev_b"] = torch.full((1, ly.HKV, ly.C), 0.25, device=device, dtype=torch.bfloat16)
+                kv_s[li]["prev_valid"] = torch.ones(1, 1, ly.C, device=device, dtype=torch.bool)
+                total_past_blks = max(0, T_c // ly.C - 1)
+                if getattr(ly, "is_cold_armed", False) and ly.max_cold_blocks > 0:
+                    n_cb = min(ly.max_cold_blocks, total_past_blks)
+                    if n_cb > 0:
+                        ck_b = torch.randn(1, ly.HKV, n_cb, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+                        kv_s[li]["cold_k_blk"] = ck_b
+                        kv_s[li]["cold_v_blk"] = torch.randn_like(ck_b)
+                        cm_b = torch.ones(1, 1, n_cb, ly.C, device=device, dtype=torch.bool)
+                        cm_b[:, :, 0, : ly.n_sinks] = False
+                        kv_s[li]["cold_mask"] = cm_b
+                        kv_s[li]["cold_pos"] = torch.zeros(1, 1, n_cb, ly.C, device=device, dtype=torch.float32)
+                        kv_s[li]["cold_kmin"] = ck_b.amin(dim=3)
+                        kv_s[li]["cold_kmax"] = ck_b.amax(dim=3)
+                if not getattr(ly, "is_cold_armed", False) or total_past_blks > ly.max_cold_blocks:
+                    kv_s[li]["ak"] = torch.randn(ly.HKV, ly.S, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+                    kv_s[li]["av"] = torch.randn_like(kv_s[li]["ak"])
+                    kv_s[li]["mass"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32)
+                    kv_s[li]["util"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32) * 0.2
+                    kv_s[li]["util_acc"] = torch.zeros(ly.HKV, ly.S, device=device, dtype=torch.float32)
+                    kv_s[li]["pm"] = torch.arange(ly.S, device=device, dtype=torch.float32).unsqueeze(0).expand(ly.HKV, -1).clone()
+                    kv_s[li]["act"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.bool)
+                    kv_s[li]["n_filled"] = ly.S
+            bolt3_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
 
-        L = cfg["num_layers"]
-        HKV = cfg["num_kv_heads"]
-        HD = cfg["head_dim"]
-        inner_hf = getattr(getattr(hf_donor, "model", hf_donor), "language_model", getattr(hf_donor, "model", hf_donor))
-        donor_kv_mb = (L * 2 * HKV * HD * T_c * 2) / (1024 ** 2)
-        from transformers.cache_utils import DynamicCache
+            dec_stu.step(nxt_tok, T_c, states_s, kv_s)
+            torch.cuda.synchronize()
+            runs_s = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                for step_i in range(gen_steps):
+                    x_h, states_s, kv_s = dec_stu.step(nxt_tok, T_c + step_i, states_s, kv_s)
+                    _ = stu.lm_head(x_h[:, -1, :]).argmax(-1)
+                torch.cuda.synchronize()
+                runs_s.append(gen_steps / (time.perf_counter() - t0))
+            bolt3_tok_s = statistics.median(runs_s)
+            del states_s, kv_s
+            torch.cuda.empty_cache()
 
-        cache_hf = DynamicCache()
-        for li in range(L):
-            cache_hf.update(
-                torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
-                torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
-                li,
+            L = cfg["num_layers"]
+            HKV = cfg["num_kv_heads"]
+            HD = cfg["head_dim"]
+            inner_hf = getattr(getattr(hf_donor, "model", hf_donor), "language_model", getattr(hf_donor, "model", hf_donor))
+            donor_kv_mb = (L * 2 * HKV * HD * T_c * 2) / (1024 ** 2)
+            from transformers.cache_utils import DynamicCache
+
+            cache_hf = DynamicCache()
+            for li in range(L):
+                cache_hf.update(
+                    torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
+                    torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
+                    li,
+                )
+            with torch.autocast("cuda", torch.bfloat16):
+                _ = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with torch.autocast("cuda", torch.bfloat16):
+                for _ in range(gen_steps):
+                    o = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
+                    _ = hf_donor.get_output_embeddings()(o.last_hidden_state[:, -1]).argmax(-1)
+            torch.cuda.synchronize()
+            donor_tok_s = gen_steps / (time.perf_counter() - t0)
+            del cache_hf
+            torch.cuda.empty_cache()
+
+            scaling.append(
+                {
+                    "context": T_c,
+                    "donor_kv_mb": round(donor_kv_mb, 2),
+                    "bolt3_state_mb": round(bolt3_state_mb, 2),
+                    "ram_saved_pct": round((1.0 - bolt3_state_mb / max(1e-4, donor_kv_mb)) * 100.0, 1),
+                    "donor_tok_s": round(donor_tok_s, 1),
+                    "bolt3_tok_s": round(bolt3_tok_s, 1),
+                    "speedup": round(bolt3_tok_s / max(1e-4, donor_tok_s), 2),
+                }
             )
-        with torch.autocast("cuda", torch.bfloat16):
-            _ = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        with torch.autocast("cuda", torch.bfloat16):
-            for _ in range(gen_steps):
-                o = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
-                _ = hf_donor.get_output_embeddings()(o.last_hidden_state[:, -1]).argmax(-1)
-        torch.cuda.synchronize()
-        donor_tok_s = gen_steps / (time.perf_counter() - t0)
-        del cache_hf
-        torch.cuda.empty_cache()
-
-        scaling.append(
-            {
-                "context": T_c,
-                "donor_kv_mb": round(donor_kv_mb, 2),
-                "bolt3_state_mb": round(bolt3_state_mb, 2),
-                "ram_saved_pct": round((1.0 - bolt3_state_mb / max(1e-4, donor_kv_mb)) * 100.0, 1),
-                "donor_tok_s": round(donor_tok_s, 1),
-                "bolt3_tok_s": round(bolt3_tok_s, 1),
-                "speedup": round(bolt3_tok_s / max(1e-4, donor_tok_s), 2),
-            }
-        )
+    finally:
+        dec_stu.close()
 
     bank_dir = Path("./_tmp_bolt3_bench_bank")
     bank = Bolt3MemoryBank(stu, tok, bank_dir=bank_dir)

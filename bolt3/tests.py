@@ -372,8 +372,171 @@ def test_left_padded_batch_parity():
 
     d_unpad = float((hs_b[1:2] - hs_u2).abs().max().item())
     d_pad0 = float((hs_b[0:1] - hs_p0).abs().max().item())
+    dec2.close()
     print(f"[left-padded batch parity]  long=({b1 == ref1},{b2 == ref2})  short<C=({sb1 == sref1},{sb2 == sref2})  5chunk_diff=({d_pad0:.2e},{d_unpad:.2e})")
     assert d_unpad < 1e-4 and d_pad0 < 1e-4
+
+
+def test_cold_armed_parity():
+    dev = _device()
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32 if dev.type == "cuda" else None
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for cold_topk in (0, 1):
+            torch.manual_seed(7 + cold_topk)
+            model = (
+                Bolt3LM(
+                    vocab_size=256,
+                    dim=64,
+                    num_layers=2,
+                    num_heads=4,
+                    num_kv_heads=2,
+                    intermediate=128,
+                    max_T=512,
+                    rope_theta=1000000.0,
+                    eps=1e-6,
+                    qk_norm=True,
+                    bolt3_S=8,
+                    bolt3_C=16,
+                    bolt3_n_sinks=4,
+                    bolt3_cold_layers=[1],
+                    bolt3_max_cold_blocks=2,
+                    bolt3_cold_topk=cold_topk,
+                )
+                .to(dev)
+                .float()
+                .eval()
+            )
+            with torch.no_grad():
+                for blk in model.blocks:
+                    blk.attn.eta_proj.bias.fill_(0.5)
+                    blk.attn.beta_proj.bias.fill_(0.5)
+                    blk.attn.res_norm.weight.fill_(0.5)
+
+            flat_b, per_tok = Bolt3Decoder.state_bytes(model)
+            assert flat_b > 0 and per_tok == 2 * 2 * 16 * 2, f"unexpected cold state_bytes: {(flat_b, per_tok)}"
+
+            x = torch.randint(1, 256, (1, 110), device=dev)
+            dec = Bolt3Decoder(model)
+            with torch.no_grad():
+                h_fwd = model(x)
+                h_pre, st, kv = dec.prefill(x[:, :70])
+                steps = [h_pre]
+                for p in range(70, 110):
+                    hp, st, kv = dec.step(x[:, p : p + 1], p, st, kv)
+                    steps.append(hp)
+                h_dec = torch.cat(steps, dim=1)
+            diff = float((h_fwd - h_dec).abs().max().item())
+            assert kv[0].get("cold_k_blk") is None
+            assert kv[1]["cold_k_blk"].shape[2] == 2
+            assert kv[1]["ak"] is not None and float(st[1].abs().max().item()) > 0.0
+            dec.close()
+            assert diff < 1e-4, f"cold_topk={cold_topk} forward/decode diff too high: {diff}"
+
+        # Left-padded multi-chunk + overflow batch parity with cold layer [1]
+        torch.manual_seed(11)
+        mb_model = (
+            Bolt3LM(
+                vocab_size=128,
+                dim=64,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate=128,
+                max_T=512,
+                rope_theta=1000000.0,
+                eps=1e-6,
+                qk_norm=True,
+                bolt3_S=8,
+                bolt3_C=16,
+                bolt3_n_sinks=4,
+                bolt3_cold_layers=[1],
+                bolt3_max_cold_blocks=2,
+                bolt3_cold_topk=0,
+            )
+            .to(dev)
+            .float()
+            .eval()
+        )
+        with torch.no_grad():
+            for blk in mb_model.blocks:
+                blk.attn.eta_proj.bias.fill_(0.5)
+                blk.attn.beta_proj.bias.fill_(0.5)
+                blk.attn.res_norm.weight.fill_(1.0)
+        dec_b = Bolt3Decoder(mb_model)
+        q1 = torch.randint(1, 128, (1, 7), device=dev)
+        q2 = torch.randint(1, 128, (1, 13), device=dev)
+        g1 = torch.randint(1, 128, (1, 80), device=dev)
+        g2 = torch.randint(1, 128, (1, 80), device=dev)
+        with torch.no_grad():
+            hu2, su2, kvu2 = dec_b.prefill(q2)
+            l_u2 = [hu2[:, -1:]]
+            for i in range(80):
+                hi, su2, kvu2 = dec_b.step(g2[:, i : i + 1], 13 + i, su2, kvu2)
+                l_u2.append(hi)
+            l_u2 = torch.cat(l_u2, dim=1)
+
+            xb = torch.zeros((2, 13), dtype=torch.long, device=dev)
+            xb[0, 6:] = q1[0]
+            xb[1] = q2[0]
+            am = torch.zeros((2, 13), dtype=torch.long, device=dev)
+            am[0, 6:] = 1
+            am[1] = 1
+            hb, sb, kvb = dec_b.prefill(xb, attn_mask=am)
+            l_b = [hb[:, -1:]]
+            rp = am.long().sum(dim=-1, keepdim=True)
+            gb = torch.cat([g1, g2], dim=0)
+            for i in range(80):
+                hi, sb, kvb = dec_b.step(gb[:, i : i + 1], 13 + i, sb, kvb, pos_ids=rp)
+                rp = rp + 1
+                l_b.append(hi)
+            l_b = torch.cat(l_b, dim=1)
+
+            hp0, sp0, kvp0 = dec_b.prefill(xb[0:1], attn_mask=am[0:1])
+            l_p0 = [hp0[:, -1:]]
+            rp0 = am[0:1].long().sum(dim=-1, keepdim=True)
+            for i in range(80):
+                hi, sp0, kvp0 = dec_b.step(g1[:, i : i + 1], 13 + i, sp0, kvp0, pos_ids=rp0)
+                rp0 = rp0 + 1
+                l_p0.append(hi)
+            l_p0 = torch.cat(l_p0, dim=1)
+        d_bu = float((l_b[1:2] - l_u2).abs().max().item())
+        d_bp = float((l_b[0:1] - l_p0).abs().max().item())
+        dec_b.close()
+        assert d_bu < 1e-4 and d_bp < 1e-4, f"cold batch parity diff too high: ({d_bp}, {d_bu})"
+
+        bf16_msg = "cpu"
+        if dev.type == "cuda":
+            m_bf = mb_model.to(torch.bfloat16).eval()
+            for blk in m_bf.blocks:
+                for p in (blk.attn.kappa, blk.attn.log_gamma):
+                    p.data = p.data.float()
+                blk.attn.beta_proj.float()
+                blk.attn.eta_proj.float()
+                blk.attn.res_norm.float()
+            d_cg = Bolt3Decoder(m_bf, use_cuda_graph=True)
+            d_eg = Bolt3Decoder(m_bf, use_cuda_graph=False)
+            with torch.no_grad():
+                xc = torch.randint(1, 128, (1, 120), device=dev)
+                hc, sc_c, kvc = d_cg.prefill(xc[:, :20])
+                he, se, kve = d_eg.prefill(xc[:, :20])
+                o_c, o_e = [hc], [he]
+                for p in range(20, 120):
+                    hc, sc_c, kvc = d_cg.step(xc[:, p : p + 1], p, sc_c, kvc)
+                    he, se, kve = d_eg.step(xc[:, p : p + 1], p, se, kve)
+                    o_c.append(hc)
+                    o_e.append(he)
+                d_bf = float((torch.cat(o_c, dim=1) - torch.cat(o_e, dim=1)).abs().max().item())
+            d_cg.close()
+            d_eg.close()
+            assert d_bf < 5e-2, f"cuda bf16 graph vs eager diff too high: {d_bf}"
+            bf16_msg = f"{d_bf:.2e}"
+
+        print(f"[cold-armed parity]         fwd_vs_dec={diff:.2e}  batch=({d_bp:.2e},{d_bu:.2e})  bf16_graph={bf16_msg}")
+    finally:
+        if old_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
 def run_all():
@@ -384,6 +547,7 @@ def run_all():
     test_memorize_forget_and_state_bytes()
     test_qwen3_style_gqa_and_legacy_remap()
     test_left_padded_batch_parity()
+    test_cold_armed_parity()
     print("ALL BOLT-3 TESTS PASSED")
 
 

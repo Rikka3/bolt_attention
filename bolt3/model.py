@@ -22,7 +22,7 @@ FP32_KEYS = ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm")
 
 
 class Bolt3Block(nn.Module):
-    def __init__(self, cfg: dict, layer_type: str = "bolt3"):
+    def __init__(self, cfg: dict, layer_type: str = "bolt3", layer_idx: int = 0):
         super().__init__()
         self.norm1 = RMSNorm(int(cfg["dim"]), float(cfg["eps"]))
         if layer_type in ("bolt3", "vsa"):
@@ -31,6 +31,7 @@ class Bolt3Block(nn.Module):
                 max_T=int(cfg.get("max_T", 2048)),
                 S=int(cfg.get("bolt3_S", 128)),
                 C=int(cfg.get("bolt3_C", 128)),
+                layer_idx=layer_idx,
             )
         else:
             self.attn = SoftmaxAttn(cfg)
@@ -89,7 +90,7 @@ class Bolt3LM(nn.Module):
             **extra_cfg,
         )
         self.embed_tokens = nn.Embedding(self.config["vocab_size"], self.config["dim"])
-        self.blocks = nn.ModuleList([Bolt3Block(self.config, lt) for lt in layer_types])
+        self.blocks = nn.ModuleList([Bolt3Block(self.config, lt, layer_idx=li) for li, lt in enumerate(layer_types)])
         self.norm = RMSNorm(self.config["dim"], self.config["eps"])
         self.lm_head = nn.Linear(self.config["dim"], self.config["vocab_size"], bias=False)
         if self.config["tie_word_embeddings"]:

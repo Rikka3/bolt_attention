@@ -41,6 +41,28 @@ def _purge_zombie_vram():
         torch.cuda.reset_peak_memory_stats()
 
 
+def _resolve_cold_layers(spec: list[int] | tuple[int, ...] | str | None, num_layers: int) -> list[int]:
+    if not spec:
+        return []
+    if isinstance(spec, str):
+        s = spec.strip().lower()
+        if not s or s in ("none", "off", "0"):
+            return []
+        if s == "auto4":
+            return [14, 19, 24, 29] if num_layers == 36 else [
+                num_layers // 3,
+                num_layers // 2,
+                (2 * num_layers) // 3,
+                max(0, num_layers - 7),
+            ]
+        if s == "auto6":
+            return [12, 16, 20, 24, 28, 32] if num_layers == 36 else [
+                max(0, int(round(num_layers * f))) for f in (0.33, 0.44, 0.56, 0.67, 0.78, 0.89)
+            ]
+        return sorted({int(x) for x in s.split(",") if x.strip()})
+    return sorted({int(x) for x in spec})
+
+
 def convert_donor_model(
     donor_id_or_dir: str,
     out_ckpt: str,
@@ -49,9 +71,12 @@ def convert_donor_model(
     bolt3_S: int = 128,
     bolt3_C: int = 128,
     freeze_proj: bool = True,
+    cold_layers: list[int] | tuple[int, ...] | str | None = None,
+    max_cold_blocks: int = 256,
+    cold_topk: int = 0,
     hf_token: str | None = None,
 ) -> str:
-    """Convert any pretrained HF Transformer (Qwen3, Llama, Mistral, etc.) to 100% Full Bolt-3 (no pure softmax)."""
+    """Convert any pretrained HF Transformer (Qwen3, Llama, Mistral, etc.) to Bolt-3 (optionally Cold-Armed Option B)."""
     t0 = time.perf_counter()
     donor_dir = fetch_any_donor(donor_id_or_dir, hf_token=hf_token)
     hf_sd = load_all_safetensors(donor_dir)
@@ -62,7 +87,11 @@ def convert_donor_model(
         bolt3_S=bolt3_S,
         bolt3_C=bolt3_C,
         bolt3_freeze_proj=freeze_proj,
+        bolt3_max_cold_blocks=max_cold_blocks,
+        bolt3_cold_topk=cold_topk,
     )
+    resolved_cold = _resolve_cold_layers(cold_layers, int(cfg["num_layers"]))
+    cfg["bolt3_cold_layers"] = resolved_cold
 
     L = cfg["num_layers"]
     print("=" * 80)
@@ -72,9 +101,10 @@ def convert_donor_model(
         f"  Donor arch    : {cfg['donor_arch']} (dim={cfg['dim']}, H={cfg['num_heads']}, "
         f"HKV={cfg['num_kv_heads']}, HD={cfg['head_dim']}, L={L})"
     )
+    cold_tag = f" | cold_layers={resolved_cold} (max_blks={max_cold_blocks}, topk={cold_topk})" if resolved_cold else ""
     print(
         f"  Bolt-3 layout : {L}/{L} Bolt3Attn layers (0 pure softmax) | "
-        f"S={bolt3_S}, C={bolt3_C}, max_T={max_T}, freeze_proj={freeze_proj}"
+        f"S={bolt3_S}, C={bolt3_C}, max_T={max_T}, freeze_proj={freeze_proj}{cold_tag}"
     )
 
     stu = Bolt3LM(**cfg)
@@ -1196,10 +1226,11 @@ def scan_checkpoint(ckpt_path: str) -> dict:
     sd = ck["model"]
     cfg = ck.get("config", {})
     num_layers = int(cfg.get("num_layers", 36))
+    cold_set = {int(i) for i in (cfg.get("bolt3_cold_layers") or ())}
     prefix_attn = "attn" if any(f"blocks.0.attn." in k for k in sd) else "vsa"
 
     print("=" * 84)
-    print(f"BOLT-3 PARAMETER SCAN: {ckpt_path} (step {ck.get('step', '?')})")
+    print(f"BOLT-3 PARAMETER SCAN: {ckpt_path} (step {ck.get('step', '?')}, cold_layers={sorted(cold_set)})")
     print("=" * 84)
     print(
         f"  {'L':>3} | {'gam_min':>7} {'gam_max':>7} | {'kappa_med':>9} | "
@@ -1221,9 +1252,10 @@ def scan_checkpoint(ckpt_path: str) -> dict:
         eb = sd[f"blocks.{li}.{prefix_attn}.eta_proj.bias"].float()
         rn = sd[f"blocks.{li}.{prefix_attn}.res_norm.weight"].float()
         rn_rms = float(rn.pow(2).mean().sqrt())
+        cold_tag = " [cold]" if li in cold_set else ""
         print(
             f"  L{li:<2d} | {float(gam.min()):7.4f} {float(gam.max()):7.4f} | {float(kap.median()):9.4f} | "
-            f"{float(bb.mean()):7.3f} {float(bw.norm()):8.4f} | {float(eb.mean()):7.3f} {float(ew.norm()):8.4f} | {rn_rms:7.4f}"
+            f"{float(bb.mean()):7.3f} {float(bw.norm()):8.4f} | {float(eb.mean()):7.3f} {float(ew.norm()):8.4f} | {rn_rms:7.4f}{cold_tag}"
         )
         out[str(li)] = dict(
             gamma_min=float(gam.min()),

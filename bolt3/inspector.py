@@ -57,6 +57,9 @@ def inspect_donor_config(
     bolt3_S: int = 128,
     bolt3_C: int = 128,
     bolt3_freeze_proj: bool = True,
+    bolt3_cold_layers: list[int] | tuple[int, ...] | None = None,
+    bolt3_max_cold_blocks: int = 256,
+    bolt3_cold_topk: int = 0,
 ) -> dict:
     with open(os.path.join(donor_dir, "config.json")) as f:
         raw_cfg = json.load(f)
@@ -118,6 +121,9 @@ def inspect_donor_config(
         bolt3_sim_v=0.88,
         bolt3_gamma_u=0.985,
         bolt3_freeze_proj=bool(bolt3_freeze_proj),
+        bolt3_cold_layers=[int(i) for i in (bolt3_cold_layers or ())],
+        bolt3_max_cold_blocks=int(bolt3_max_cold_blocks),
+        bolt3_cold_topk=int(bolt3_cold_topk),
         layer_types=["bolt3"] * num_layers,
     )
 
