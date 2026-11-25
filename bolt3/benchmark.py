@@ -862,13 +862,16 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
             with torch.autocast("cuda", torch.bfloat16):
                 _ = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
             torch.cuda.synchronize()
-            t0 = time.perf_counter()
+            runs_d = []
             with torch.autocast("cuda", torch.bfloat16):
-                for _ in range(gen_steps):
-                    o = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
-                    _ = hf_donor.get_output_embeddings()(o.last_hidden_state[:, -1]).argmax(-1)
-            torch.cuda.synchronize()
-            donor_tok_s = gen_steps / (time.perf_counter() - t0)
+                for _ in range(3):
+                    t0 = time.perf_counter()
+                    for _ in range(gen_steps):
+                        o = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
+                        _ = hf_donor.get_output_embeddings()(o.last_hidden_state[:, -1]).argmax(-1)
+                    torch.cuda.synchronize()
+                    runs_d.append(gen_steps / (time.perf_counter() - t0))
+            donor_tok_s = statistics.median(runs_d)
             del cache_hf
             torch.cuda.empty_cache()
 

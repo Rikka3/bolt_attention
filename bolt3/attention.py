@@ -564,8 +564,9 @@ class Bolt3Attn(nn.Module):
         b, T, _ = x.shape
         q_raw, k_raw, v_all_in = self.head_qkv(x)
         q_rope, k_rope = self.rope(q_raw), self.rope(k_raw)
-        beta_all = torch.sigmoid(self.beta_proj(x)).transpose(1, 2)
-        eta_all = torch.tanh(self.eta_proj(x)).transpose(1, 2).unsqueeze(-1)
+        xp_f = x if (x.dtype == self.beta_proj.weight.dtype or torch.is_autocast_enabled("cuda")) else x.to(self.beta_proj.weight.dtype)
+        beta_all = torch.sigmoid(self.beta_proj(xp_f)).transpose(1, 2)
+        eta_all = torch.tanh(self.eta_proj(xp_f)).transpose(1, 2).unsqueeze(-1)
         gam = self.gamma_delta()
         inv_freq = self.rope.inv_freq.to(x.device)
         diag_eye = torch.eye(self.S, device=x.device, dtype=torch.bool).unsqueeze(0)

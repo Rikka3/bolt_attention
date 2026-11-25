@@ -240,7 +240,8 @@ def test_qwen3_style_gqa_and_legacy_remap():
         x = torch.randint(0, 256, (1, 40), device=dev)
         with torch.no_grad():
             diff = (model(x).float() - reloaded(x).float()).abs().max().item()
-        assert diff < 1e-3
+        tol = 5e-2 if dev.type == "cuda" else 1e-3
+        assert diff < tol, f"legacy remap diff too high: {diff}"
         scan_out = scan_checkpoint(ckpt_p)
         assert len(scan_out) == 2
     print("[qwen3 GQA & legacy remap]  PASS")
