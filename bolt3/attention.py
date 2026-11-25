@@ -3,11 +3,15 @@ and Gershgorin Eviction-to-Delta Residual Associative Memory (M_res).
 """
 from __future__ import annotations
 
+import itertools
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .nn import RMSNorm, RoPE, apply_rope_cos_sin, apply_rope_pos, repeat_kv
+
+_RUNNER_UID = itertools.count(1)
 
 
 class StaticKV:
@@ -760,6 +764,7 @@ class _Bolt3GraphRunner:
         dtype: torch.dtype,
         cold_caps: tuple[int, ...] | None = None,
     ):
+        self.uid = next(_RUNNER_UID)
         self.model = model
         self.batch_size = batch_size
         self.device = device
@@ -1761,7 +1766,7 @@ class Bolt3Decoder:
         device: torch.device,
         dt: torch.dtype,
     ):
-        rid = id(runner)
+        rid = runner.uid
         for li, blk in enumerate(dec.model.blocks):
             sc = kv_caches[li]
             ly: Bolt3Attn = blk.attn
@@ -1776,7 +1781,11 @@ class Bolt3Decoder:
                 cold_cap,
                 id(sc.get("cold_k_blk")),
             )
-            if sc.get("_runner_id") == expected_sig:
+            if (
+                sc.get("_runner_id") == expected_sig
+                and runner.states[li] is states[li]
+                and runner.buf_k[li] is sc.get("buf_k")
+            ):
                 continue
             dec._sync_unified_bufs(sc, ly, b, device, dt)
             if runner.states[li] is not states[li]:
