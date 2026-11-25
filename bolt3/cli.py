@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None):
     p_conv.add_argument("--S", type=int, default=128, help="Attractor slot count S (default: 128)")
     p_conv.add_argument("--C", type=int, default=128, help="Local chunk size C (default: 128)")
     p_conv.add_argument("--no-freeze-proj", action="store_true", help="Allow training q/k/v/o projections during healing")
-    p_conv.add_argument("--cold-layers", default=None, help="Optional cold-armed layer indices (e.g. '14,19,24,29', 'auto4', 'auto6')")
+    p_conv.add_argument("--cold-layers", default=None, help="Optional cold-armed layer indices (e.g. '11,19,27', 'auto3', 'auto4', 'auto6')")
     p_conv.add_argument("--max-cold-blocks", type=int, default=256, help="Max chunk blocks retained per cold-armed layer (default: 256)")
     p_conv.add_argument("--cold-topk", type=int, default=0, help="Top-k cold block selection per query (0 = attend all cold blocks)")
     p_conv.add_argument("--hf-token", default=None, help="Optional HuggingFace token for gated models")

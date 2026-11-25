@@ -132,7 +132,13 @@ class Bolt3MemoryBank:
         ]
         max_erase_err = max(errs) if errs else 0.0
 
-        q_prompt = f"Question: {question.strip()}\nAnswer:"
+        tmpl = getattr(self.tokenizer, "chat_template", None) or ""
+        if isinstance(tmpl, dict):
+            tmpl = " ".join(str(v) for v in tmpl.values())
+        if "<think>" in tmpl:
+            q_prompt = f"Question: {question.strip()}\n<think>\n\n</think>\n\nAnswer:"
+        else:
+            q_prompt = f"Question: {question.strip()}\nAnswer:"
         q_ids = torch.tensor(
             [self.tokenizer.encode(q_prompt, add_special_tokens=False)], dtype=torch.long, device=self.device
         )
@@ -148,6 +154,8 @@ class Bolt3MemoryBank:
             eos_ids=eos_ids,
         )
         decoded = self.tokenizer.decode(gen_toks[0].tolist(), skip_special_tokens=True).strip()
+        if "</think>" in decoded:
+            decoded = decoded.split("</think>")[-1].strip()
         answer = decoded.splitlines()[0].strip() if decoded else ""
 
         return dict(

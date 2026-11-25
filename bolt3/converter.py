@@ -41,24 +41,43 @@ def _purge_zombie_vram():
         torch.cuda.reset_peak_memory_stats()
 
 
-def _resolve_cold_layers(spec: list[int] | tuple[int, ...] | str | None, num_layers: int) -> list[int]:
+def _resolve_cold_layers(
+    spec: list[int] | tuple[int, ...] | str | None,
+    num_layers: int,
+    layer_types: list[str] | None = None,
+) -> list[int]:
     if not spec:
         return []
+    b3_idxs = (
+        [i for i, lt in enumerate(layer_types) if lt in ("bolt3", "vsa")]
+        if layer_types
+        else list(range(num_layers))
+    )
     if isinstance(spec, str):
         s = spec.strip().lower()
         if not s or s in ("none", "off", "0"):
             return []
+        if s == "auto3":
+            if len(b3_idxs) == 8:
+                return [b3_idxs[2], b3_idxs[4], b3_idxs[6]]  # [11, 19, 27] on Qwen3.5
+            n = len(b3_idxs)
+            return sorted({b3_idxs[max(0, min(n - 1, int(round((n - 1) * f))))] for f in (0.33, 0.58, 0.84)})
         if s == "auto4":
-            return [14, 19, 24, 29] if num_layers == 36 else [
-                num_layers // 3,
-                num_layers // 2,
-                (2 * num_layers) // 3,
-                max(0, num_layers - 7),
+            if num_layers == 36 and len(b3_idxs) == 36:
+                return [14, 19, 24, 29]
+            if len(b3_idxs) == 8:
+                return [b3_idxs[1], b3_idxs[3], b3_idxs[5], b3_idxs[7]]  # [7, 15, 23, 31] on Qwen3.5
+            return [
+                b3_idxs[min(len(b3_idxs) - 1, max(0, int(round((len(b3_idxs) - 1) * f))))]
+                for f in (0.33, 0.50, 0.67, 0.83)
             ]
         if s == "auto6":
-            return [12, 16, 20, 24, 28, 32] if num_layers == 36 else [
-                max(0, int(round(num_layers * f))) for f in (0.33, 0.44, 0.56, 0.67, 0.78, 0.89)
-            ]
+            if num_layers == 36 and len(b3_idxs) == 36:
+                return [12, 16, 20, 24, 28, 32]
+            return sorted({
+                b3_idxs[min(len(b3_idxs) - 1, max(0, int(round((len(b3_idxs) - 1) * f))))]
+                for f in (0.33, 0.44, 0.56, 0.67, 0.78, 0.89)
+            })
         return sorted({int(x) for x in s.split(",") if x.strip()})
     return sorted({int(x) for x in spec})
 
@@ -90,7 +109,7 @@ def convert_donor_model(
         bolt3_max_cold_blocks=max_cold_blocks,
         bolt3_cold_topk=cold_topk,
     )
-    resolved_cold = _resolve_cold_layers(cold_layers, int(cfg["num_layers"]))
+    resolved_cold = _resolve_cold_layers(cold_layers, int(cfg["num_layers"]), cfg.get("layer_types"))
     cfg["bolt3_cold_layers"] = resolved_cold
 
     L = cfg["num_layers"]
