@@ -1049,15 +1049,19 @@ class Bolt3Decoder:
                 scores[r, seen] = torch.where(sel < 0, sel * repetition_penalty, sel / repetition_penalty)
         if temperature <= 1e-5:
             return scores.argmax(-1, keepdim=True)
-        probs = F.softmax(scores / temperature, dim=-1)
+        scaled = scores / temperature
+        if top_k is not None and top_k > 0:
+            k = min(int(top_k), scaled.size(-1))
+            kth = torch.topk(scaled, k, dim=-1).values[..., -1:]
+            scaled = scaled.masked_fill(scaled < kth, float("-inf"))
+        probs = F.softmax(scaled, dim=-1)
         if top_p < 1.0:
             sp, si = torch.sort(probs, descending=True, dim=-1)
             cp = torch.cumsum(sp, dim=-1)
             sp[cp - sp > top_p] = 0.0
             sp.div_(sp.sum(dim=-1, keepdim=True).clamp_min(1e-12))
             return si.gather(-1, torch.multinomial(sp, 1))
-        tv, ti = torch.topk(scores / temperature, min(top_k, scores.size(-1)), dim=-1)
-        return ti.gather(-1, torch.multinomial(F.softmax(tv, -1), 1))
+        return torch.multinomial(probs, 1)
 
     @staticmethod
     def _refresh_attractor_cache(sc: dict, ly: Bolt3Attn, b: int, inv_freq: torch.Tensor):

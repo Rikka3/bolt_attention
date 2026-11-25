@@ -498,7 +498,9 @@ def _eval_model_body(
                         x_in,
                         max_new_tokens=max_new,
                         temperature=temperature,
+                        top_k=0,
                         top_p=top_p,
+                        repetition_penalty=1.0,
                         eos_ids=eos_ids,
                         close_think_ids=c_ids,
                         attn_mask=attn_m,
@@ -511,7 +513,7 @@ def _eval_model_body(
                             g_ids = g_ids[:-1]
                         res[orig_idx] = (
                             tok.decode(g_ids, skip_special_tokens=True),
-                            n_r,
+                            len(g_ids),
                             (not hit_eos and n_r >= max_new),
                         )
                 else:
@@ -525,17 +527,21 @@ def _eval_model_body(
                         if need_close
                         else None
                     )
-                    gen_t = model.generate(
-                        input_ids=x_in,
-                        attention_mask=attn_m,
-                        max_new_tokens=max_new,
-                        do_sample=sample,
-                        temperature=temperature if sample else None,
-                        top_p=top_p if sample else None,
-                        logits_processor=lp,
-                        eos_token_id=list(eos_ids),
-                        pad_token_id=pad_id,
-                    )
+                    gen_kwargs = {
+                        "input_ids": x_in,
+                        "attention_mask": attn_m,
+                        "max_new_tokens": max_new,
+                        "do_sample": sample,
+                        "repetition_penalty": 1.0,
+                        "logits_processor": lp,
+                        "eos_token_id": list(eos_ids),
+                        "pad_token_id": pad_id,
+                    }
+                    if sample:
+                        gen_kwargs["temperature"] = temperature
+                        gen_kwargs["top_p"] = top_p
+                        gen_kwargs["top_k"] = 0
+                    gen_t = model.generate(**gen_kwargs)
                     for r_i, (orig_idx, _) in enumerate(ch):
                         raw_ids = gen_t[r_i, max_l:].tolist()
                         cut = next((k for k, tid in enumerate(raw_ids) if tid in eos_ids), None)
@@ -780,91 +786,146 @@ def _eval_model_body(
     return out
 
 
+def _live_tensor_bytes(root) -> int:
+    """Count deduplicated GPU/Tensor bytes reachable from states, kv caches, and runners."""
+    seen_ptrs: set[int] = set()
+    visited_objs: set[int] = set()
+    total = 0
+
+    def _walk(obj):
+        nonlocal total
+        if obj is None or isinstance(obj, (int, float, bool, str, bytes, torch.dtype, torch.device)):
+            return
+        oid = id(obj)
+        if oid in visited_objs:
+            return
+        visited_objs.add(oid)
+        if torch.is_tensor(obj):
+            ptr = obj.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                total += obj.numel() * obj.element_size()
+            return
+        if isinstance(obj, dict):
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                _walk(v)
+        elif hasattr(obj, "__dict__"):
+            for k, v in obj.__dict__.items():
+                if k not in ("model", "graph"):
+                    _walk(v)
+
+    _walk(root)
+    return total
+
+
 @torch.no_grad()
 def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device) -> dict:
-    gen_steps = 32
+    gen_steps = max(128, int(cfg.get("bolt3_C", 128)))
     ctx_lengths = (2048, 8192, 16384, 32768, 65536)
     scaling = []
     dec_stu = Bolt3Decoder(stu, max_cache_pos=70000)
 
+    def _make_stu_state(t_ctx: int):
+        states_s, kv_s = dec_stu.blank_state(stu, 1, device, max_kv_len=t_ctx + gen_steps + 32)
+        for li, blk in enumerate(stu.blocks):
+            ly = blk.attn
+            kv_s[li]["sink_k"] = torch.randn(1, ly.HKV, ly.n_sinks, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+            kv_s[li]["sink_v"] = torch.randn_like(kv_s[li]["sink_k"])
+            kv_s[li]["sink_valid"] = torch.ones(1, 1, ly.n_sinks, device=device, dtype=torch.bool)
+            kv_s[li]["sink_filled"] = torch.full((1,), ly.n_sinks, device=device, dtype=torch.long)
+            kv_s[li]["prev_kr"] = torch.randn(1, ly.HKV, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+            kv_s[li]["prev_kp"] = torch.randn_like(kv_s[li]["prev_kr"])
+            kv_s[li]["prev_v"] = torch.randn_like(kv_s[li]["prev_kr"])
+            kv_s[li]["prev_pos"] = torch.arange(t_ctx - ly.C, t_ctx, device=device, dtype=torch.float32).view(1, 1, ly.C)
+            kv_s[li]["prev_b"] = torch.full((1, ly.HKV, ly.C), 0.25, device=device, dtype=torch.bfloat16)
+            kv_s[li]["prev_valid"] = torch.ones(1, 1, ly.C, device=device, dtype=torch.bool)
+            total_past_blks = max(0, t_ctx // ly.C - 1)
+            if getattr(ly, "is_cold_armed", False) and ly.max_cold_blocks > 0:
+                n_cb = min(ly.max_cold_blocks, total_past_blks)
+                if n_cb > 0:
+                    ck_b = torch.randn(1, ly.HKV, n_cb, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+                    kv_s[li]["cold_k_blk"] = ck_b
+                    kv_s[li]["cold_v_blk"] = torch.randn_like(ck_b)
+                    cm_b = torch.ones(1, 1, n_cb, ly.C, device=device, dtype=torch.bool)
+                    cm_b[:, :, 0, : ly.n_sinks] = False
+                    kv_s[li]["cold_mask"] = cm_b
+                    kv_s[li]["cold_pos"] = torch.zeros(1, 1, n_cb, ly.C, device=device, dtype=torch.float32)
+                    kv_s[li]["cold_b"] = torch.full((1, ly.HKV, n_cb, ly.C), 0.25, device=device, dtype=torch.bfloat16)
+                    if ly.cold_topk > 0:
+                        kv_s[li]["cold_kmin"] = ck_b.amin(dim=3)
+                        kv_s[li]["cold_kmax"] = ck_b.amax(dim=3)
+            if not getattr(ly, "is_cold_armed", False) or total_past_blks > ly.max_cold_blocks:
+                kv_s[li]["ak"] = torch.randn(ly.HKV, ly.S, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+                kv_s[li]["av"] = torch.randn_like(kv_s[li]["ak"])
+                kv_s[li]["mass"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32)
+                kv_s[li]["util"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32) * 0.2
+                kv_s[li]["util_acc"] = torch.zeros(ly.HKV, ly.S, device=device, dtype=torch.float32)
+                kv_s[li]["pm"] = torch.arange(ly.S, device=device, dtype=torch.float32).unsqueeze(0).expand(ly.HKV, -1).clone()
+                kv_s[li]["act"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.bool)
+                kv_s[li]["n_filled"] = ly.S
+        return states_s, kv_s
+
     try:
+        from transformers.cache_utils import DynamicCache
+
+        L = cfg["num_layers"]
+        HKV = cfg["num_kv_heads"]
+        HD = cfg["head_dim"]
+        inner_hf = getattr(getattr(hf_donor, "model", hf_donor), "language_model", getattr(hf_donor, "model", hf_donor))
+
+        def _make_donor_cache(t_ctx: int):
+            c = DynamicCache()
+            for li in range(L):
+                c.update(
+                    torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
+                    torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
+                    li,
+                )
+            return c
+
         for T_c in ctx_lengths:
             nxt_tok = torch.tensor([[100]], device=device, dtype=torch.long)
 
+            states_s, kv_s = _make_stu_state(T_c)
+            x_w, states_s, kv_s = dec_stu.step(nxt_tok, T_c, states_s, kv_s)
+            _ = stu.lm_head(x_w[:, -1, :]).argmax(-1)
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            base_mem_stu = torch.cuda.memory_allocated()
-            states_s, kv_s = dec_stu.blank_state(stu, 1, device, max_kv_len=T_c + gen_steps + 32)
-            for li, blk in enumerate(stu.blocks):
-                ly = blk.attn
-                kv_s[li]["sink_k"] = torch.randn(1, ly.HKV, ly.n_sinks, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-                kv_s[li]["sink_v"] = torch.randn_like(kv_s[li]["sink_k"])
-                kv_s[li]["sink_valid"] = torch.ones(1, 1, ly.n_sinks, device=device, dtype=torch.bool)
-                kv_s[li]["sink_filled"] = torch.full((1,), ly.n_sinks, device=device, dtype=torch.long)
-                kv_s[li]["prev_kr"] = torch.randn(1, ly.HKV, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-                kv_s[li]["prev_kp"] = torch.randn_like(kv_s[li]["prev_kr"])
-                kv_s[li]["prev_v"] = torch.randn_like(kv_s[li]["prev_kr"])
-                kv_s[li]["prev_pos"] = torch.arange(T_c - ly.C, T_c, device=device, dtype=torch.float32).view(1, 1, ly.C)
-                kv_s[li]["prev_b"] = torch.full((1, ly.HKV, ly.C), 0.25, device=device, dtype=torch.bfloat16)
-                kv_s[li]["prev_valid"] = torch.ones(1, 1, ly.C, device=device, dtype=torch.bool)
-                total_past_blks = max(0, T_c // ly.C - 1)
-                if getattr(ly, "is_cold_armed", False) and ly.max_cold_blocks > 0:
-                    n_cb = min(ly.max_cold_blocks, total_past_blks)
-                    if n_cb > 0:
-                        ck_b = torch.randn(1, ly.HKV, n_cb, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-                        kv_s[li]["cold_k_blk"] = ck_b
-                        kv_s[li]["cold_v_blk"] = torch.randn_like(ck_b)
-                        cm_b = torch.ones(1, 1, n_cb, ly.C, device=device, dtype=torch.bool)
-                        cm_b[:, :, 0, : ly.n_sinks] = False
-                        kv_s[li]["cold_mask"] = cm_b
-                        kv_s[li]["cold_pos"] = torch.zeros(1, 1, n_cb, ly.C, device=device, dtype=torch.float32)
-                        kv_s[li]["cold_kmin"] = ck_b.amin(dim=3)
-                        kv_s[li]["cold_kmax"] = ck_b.amax(dim=3)
-                if not getattr(ly, "is_cold_armed", False) or total_past_blks > ly.max_cold_blocks:
-                    kv_s[li]["ak"] = torch.randn(ly.HKV, ly.S, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-                    kv_s[li]["av"] = torch.randn_like(kv_s[li]["ak"])
-                    kv_s[li]["mass"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32)
-                    kv_s[li]["util"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32) * 0.2
-                    kv_s[li]["util_acc"] = torch.zeros(ly.HKV, ly.S, device=device, dtype=torch.float32)
-                    kv_s[li]["pm"] = torch.arange(ly.S, device=device, dtype=torch.float32).unsqueeze(0).expand(ly.HKV, -1).clone()
-                    kv_s[li]["act"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.bool)
-                    kv_s[li]["n_filled"] = ly.S
-            bolt3_state_mb = (torch.cuda.memory_allocated() - base_mem_stu) / (1024 ** 2)
+            # Measure full allocated live runtime state including runtime buffers & CUDA graph work buffers
+            bolt3_state_mb = _live_tensor_bytes([states_s, kv_s, list(dec_stu._graph_runners.values())]) / (1024 ** 2)
+            del states_s, kv_s
 
-            dec_stu.step(nxt_tok, T_c, states_s, kv_s)
-            torch.cuda.synchronize()
             runs_s = []
             for _ in range(3):
+                states_s, kv_s = _make_stu_state(T_c)
+                torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 for step_i in range(gen_steps):
                     x_h, states_s, kv_s = dec_stu.step(nxt_tok, T_c + step_i, states_s, kv_s)
                     _ = stu.lm_head(x_h[:, -1, :]).argmax(-1)
                 torch.cuda.synchronize()
                 runs_s.append(gen_steps / (time.perf_counter() - t0))
+                del states_s, kv_s
             bolt3_tok_s = statistics.median(runs_s)
-            del states_s, kv_s
             torch.cuda.empty_cache()
 
-            L = cfg["num_layers"]
-            HKV = cfg["num_kv_heads"]
-            HD = cfg["head_dim"]
-            inner_hf = getattr(getattr(hf_donor, "model", hf_donor), "language_model", getattr(hf_donor, "model", hf_donor))
             donor_kv_mb = (L * 2 * HKV * HD * T_c * 2) / (1024 ** 2)
-            from transformers.cache_utils import DynamicCache
-
-            cache_hf = DynamicCache()
-            for li in range(L):
-                cache_hf.update(
-                    torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
-                    torch.randn(1, HKV, T_c, HD, device=device, dtype=torch.bfloat16),
-                    li,
-                )
+            cache_hf = _make_donor_cache(T_c)
             with torch.autocast("cuda", torch.bfloat16):
-                _ = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
+                o_w = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
+                _ = hf_donor.get_output_embeddings()(o_w.last_hidden_state[:, -1]).argmax(-1)
             torch.cuda.synchronize()
             runs_d = []
             with torch.autocast("cuda", torch.bfloat16):
                 for _ in range(3):
+                    if hasattr(cache_hf, "crop"):
+                        cache_hf.crop(T_c)
+                    else:
+                        del cache_hf
+                        cache_hf = _make_donor_cache(T_c)
+                    torch.cuda.synchronize()
                     t0 = time.perf_counter()
                     for _ in range(gen_steps):
                         o = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)
