@@ -715,7 +715,11 @@ def _kd_microbatch_backward(
     if stu.config["vocab_size"] > 200_000:
         tok_slice = min(tok_slice, 1024)
     w_lm_s_f32 = stu.lm_head.weight.float()
-    w_lm_t_f32 = w_lm_t.float()
+    w_lm_t_f32 = (
+        w_lm_s_f32
+        if (w_lm_t.data_ptr() == stu.lm_head.weight.data_ptr() and not stu.lm_head.weight.requires_grad)
+        else w_lm_t.float()
+    )
     loss = torch.zeros((), device=device, dtype=torch.float32)
 
     with torch.no_grad():
