@@ -693,6 +693,83 @@ input[type="range"] {
   color: var(--m-4);
 }
 
+/* Released Bolt-3 Models Lower List */
+.models-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.model-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.model-card.is-active {
+  border-color: var(--border-bright);
+  box-shadow: 0 12px 32px rgba(250, 80, 15, 0.08);
+}
+
+.model-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.model-tag {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--m-4);
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+
+.model-card h3 {
+  margin: 0;
+  font-size: 1.24rem;
+  letter-spacing: -0.02em;
+}
+
+.model-badge {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  padding: 4px 10px;
+  border: 1px solid rgba(255, 175, 0, 0.35);
+  background: rgba(255, 175, 0, 0.1);
+  color: var(--m-4);
+  white-space: nowrap;
+}
+
+.model-arch {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--text-dim);
+}
+
+.model-stats-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 14px;
+  background: #0a0a0f;
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+.model-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: auto;
+}
+
 /* CLI + Footer */
 .cli-grid {
   display: grid;
@@ -756,7 +833,7 @@ footer {
     gap: 48px;
     padding-bottom: 40px;
   }
-  .bench-grid, .cli-grid {
+  .bench-grid, .cli-grid, .models-grid {
     grid-template-columns: 1fr;
   }
   .layer-grid {

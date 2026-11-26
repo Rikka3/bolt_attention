@@ -20,6 +20,7 @@
       <a href="#walkthrough" class="hide-sm">Architecture</a>
       <a href="#layers" class="hide-sm">Layer Map</a>
       <a href="#benchmarks" class="hide-sm">Benchmarks</a>
+      <a href="#models" class="hide-sm">Models</a>
       <a href="https://huggingface.co/rikkathree/bolt-qwen3.5-4b" target="_blank" rel="noopener" id="nav-hf-link">HF :: Qwen3.5-4B</a>
       <a href="https://github.com/Rikka3/bolt_attention/tree/bolt3" target="_blank" rel="noopener" class="nav-pill">GitHub :: bolt3</a>
     </nav>
@@ -241,10 +242,69 @@
     </div>
   </section>
 
+  <!-- ALL BOLT-3 MODELS -->
+  <section class="section" id="models" data-reveal>
+    <div class="section-header">
+      <div class="section-tag">04 / RELEASED BOLT-3 MODELS</div>
+      <h2 class="section-title">All Bounded-State Bolt-3 Checkpoints</h2>
+      <p class="section-desc">
+        Only the released Bolt-3 models are listed below (no quadratic donor baselines). Click a model card to inspect its layers, benchmarks, and scaling profile above.
+      </p>
+    </div>
+
+    <div class="models-grid">
+      <article class="model-card is-active" id="card-qwen35">
+        <div class="model-card-head">
+          <div>
+            <div class="model-tag">FLAGSHIP HYBRID &bull; 4.206B PARAMS &bull; ZERO PURE SOFTMAX</div>
+            <h3>Bolt-3.5 (Qwen3.5-4B Option-B)</h3>
+          </div>
+          <span class="model-badge">auto3</span>
+        </div>
+        <p class="model-arch">
+          24 preserved <code>GatedDeltaNet</code> + 5 pure <code>O(1)</code> <code>Bolt3Attn</code> + 3 sparse Cold-Armed <code>Bolt3Attn</code> (<code>[11, 19, 27]</code>)
+        </p>
+        <div class="model-stats-row">
+          <div><div class="ld-label">MMLU / IFEval</div><div class="ld-val">70.0% / 87.5%</div></div>
+          <div><div class="ld-label">4-Needle NIAH</div><div class="ld-val">4 / 4 @ 32k</div></div>
+          <div><div class="ld-label">State @ 64k</div><div class="ld-val">858.26 MB</div></div>
+          <div><div class="ld-label">Decode @ 64k</div><div class="ld-val">50.2 tok/s</div></div>
+        </div>
+        <div class="model-card-actions">
+          <button type="button" class="btn btn-primary" id="card-btn-qwen35">Inspect in Walkthrough &uarr;</button>
+          <a href="https://huggingface.co/rikkathree/bolt-qwen3.5-4b" target="_blank" rel="noopener" class="btn">HuggingFace Repo &nearr;</a>
+        </div>
+      </article>
+
+      <article class="model-card" id="card-qwen3">
+        <div class="model-card-head">
+          <div>
+            <div class="model-tag">FULL RETROFIT &bull; 36 / 36 BOLT3ATTN &bull; ZERO PURE SOFTMAX</div>
+            <h3>Bolt-3 (Qwen3-4B Option-B)</h3>
+          </div>
+          <span class="model-badge">auto4</span>
+        </div>
+        <p class="model-arch">
+          32 pure <code>O(1)</code> <code>Bolt3Attn</code> + 4 sparse Cold-Armed <code>Bolt3Attn</code> (<code>[14, 19, 24, 29]</code>)
+        </p>
+        <div class="model-stats-row">
+          <div><div class="ld-label">GSM8K / IFEval</div><div class="ld-val">90.0% / 87.5%</div></div>
+          <div><div class="ld-label">1-Needle NIAH</div><div class="ld-val">100% @ 16k</div></div>
+          <div><div class="ld-label">State @ 64k</div><div class="ld-val">1,186.11 MB</div></div>
+          <div><div class="ld-label">Decode @ 64k</div><div class="ld-val">44.0 tok/s</div></div>
+        </div>
+        <div class="model-card-actions">
+          <button type="button" class="btn btn-primary" id="card-btn-qwen3">Inspect in Walkthrough &uarr;</button>
+          <a href="https://huggingface.co/rikkathree/bolt-qwen3-4b" target="_blank" rel="noopener" class="btn">HuggingFace Repo &nearr;</a>
+        </div>
+      </article>
+    </div>
+  </section>
+
   <!-- QUICKSTART -->
   <section class="section" data-reveal>
     <div class="section-header">
-      <div class="section-tag">04 / RUN IT LOCALLY OR IN CLOUD</div>
+      <div class="section-tag">05 / RUN IT LOCALLY OR IN CLOUD</div>
       <h2 class="section-title">Drop-In PyTorch Package</h2>
     </div>
     <div class="cli-grid">

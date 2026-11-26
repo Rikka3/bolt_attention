@@ -674,6 +674,12 @@
       b35.classList.toggle("active", key === "qwen35");
       b3.classList.toggle("active", key === "qwen3");
     }
+    const c35 = document.getElementById("card-qwen35");
+    const c3 = document.getElementById("card-qwen3");
+    if (c35 && c3) {
+      c35.classList.toggle("is-active", key === "qwen35");
+      c3.classList.toggle("is-active", key === "qwen3");
+    }
     const ey = document.getElementById("hero-eyebrow");
     if (ey) ey.textContent = currentModel.eyebrow;
     const hfNav = document.getElementById("nav-hf-link");
@@ -714,6 +720,20 @@
   if (btnQ35 && btnQ3) {
     btnQ35.addEventListener("click", () => switchModel("qwen35"));
     btnQ3.addEventListener("click", () => switchModel("qwen3"));
+  }
+  const cBtnQ35 = document.getElementById("card-btn-qwen35");
+  const cBtnQ3 = document.getElementById("card-btn-qwen3");
+  if (cBtnQ35) {
+    cBtnQ35.addEventListener("click", () => {
+      switchModel("qwen35");
+      document.getElementById("layers")?.scrollIntoView({ behavior: "smooth" });
+    });
+  }
+  if (cBtnQ3) {
+    cBtnQ3.addEventListener("click", () => {
+      switchModel("qwen3");
+      document.getElementById("layers")?.scrollIntoView({ behavior: "smooth" });
+    });
   }
 
   // --- Context Scaling SVG + Scrubber ---
