@@ -7,63 +7,163 @@
   const OK_GREEN = "#3fb950";
 
   // Exact verified parameter scan from bolt3_b_qwen3_4b_latest.pth (step=100)
-  const LAYER_SCAN = [
-    { l: 0, cold: false, gam: "0.9697-0.9698", kap: "0.9979", bw: "0.0140", ew: "0.6046", rms: "0.0505" },
-    { l: 1, cold: false, gam: "0.9695-0.9698", kap: "0.9970", bw: "0.0724", ew: "0.8206", rms: "0.0512" },
-    { l: 2, cold: false, gam: "0.9694-0.9699", kap: "0.9967", bw: "0.1441", ew: "0.9346", rms: "0.0513" },
-    { l: 3, cold: false, gam: "0.9692-0.9697", kap: "0.9968", bw: "0.3211", ew: "1.0507", rms: "0.0544" },
-    { l: 4, cold: false, gam: "0.9693-0.9698", kap: "0.9998", bw: "0.2409", ew: "0.9817", rms: "0.0547" },
-    { l: 5, cold: false, gam: "0.9692-0.9700", kap: "0.9935", bw: "0.2339", ew: "0.9659", rms: "0.0535" },
-    { l: 6, cold: false, gam: "0.9691-0.9698", kap: "0.9964", bw: "0.2549", ew: "0.9628", rms: "0.0525" },
-    { l: 7, cold: false, gam: "0.9694-0.9700", kap: "1.0015", bw: "0.4674", ew: "0.9902", rms: "0.0521" },
-    { l: 8, cold: false, gam: "0.9692-0.9699", kap: "1.0013", bw: "0.3684", ew: "0.9887", rms: "0.0533" },
-    { l: 9, cold: false, gam: "0.9691-0.9700", kap: "1.0046", bw: "0.5123", ew: "1.0945", rms: "0.0558" },
-    { l: 10, cold: false, gam: "0.9692-0.9697", kap: "1.0018", bw: "0.4706", ew: "1.0440", rms: "0.0539" },
-    { l: 11, cold: false, gam: "0.9692-0.9698", kap: "1.0032", bw: "0.4422", ew: "1.0615", rms: "0.0549" },
-    { l: 12, cold: false, gam: "0.9692-0.9697", kap: "1.0027", bw: "0.5108", ew: "1.0983", rms: "0.0553" },
-    { l: 13, cold: false, gam: "0.9692-0.9697", kap: "1.0049", bw: "0.5121", ew: "1.0641", rms: "0.0544" },
-    { l: 14, cold: true, gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
-    { l: 15, cold: false, gam: "0.9693-0.9699", kap: "0.9994", bw: "0.5045", ew: "0.9986", rms: "0.0522" },
-    { l: 16, cold: false, gam: "0.9691-0.9697", kap: "1.0001", bw: "0.5585", ew: "1.0678", rms: "0.0542" },
-    { l: 17, cold: false, gam: "0.9692-0.9698", kap: "1.0002", bw: "0.5731", ew: "1.0866", rms: "0.0536" },
-    { l: 18, cold: false, gam: "0.9694-0.9698", kap: "0.9958", bw: "0.5230", ew: "1.0127", rms: "0.0523" },
-    { l: 19, cold: true, gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
-    { l: 20, cold: false, gam: "0.9693-0.9699", kap: "1.0022", bw: "0.5372", ew: "1.0477", rms: "0.0532" },
-    { l: 21, cold: false, gam: "0.9693-0.9699", kap: "1.0010", bw: "0.5340", ew: "0.9828", rms: "0.0514" },
-    { l: 22, cold: false, gam: "0.9694-0.9699", kap: "1.0036", bw: "0.5540", ew: "0.9743", rms: "0.0518" },
-    { l: 23, cold: false, gam: "0.9696-0.9698", kap: "1.0009", bw: "0.5389", ew: "0.9675", rms: "0.0498" },
-    { l: 24, cold: true, gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
-    { l: 25, cold: false, gam: "0.9693-0.9701", kap: "1.0018", bw: "0.5567", ew: "0.9340", rms: "0.0502" },
-    { l: 26, cold: false, gam: "0.9692-0.9702", kap: "0.9986", bw: "0.5572", ew: "0.9605", rms: "0.0538" },
-    { l: 27, cold: false, gam: "0.9692-0.9700", kap: "1.0007", bw: "0.5571", ew: "0.9486", rms: "0.0533" },
-    { l: 28, cold: false, gam: "0.9696-0.9699", kap: "0.9967", bw: "0.5346", ew: "0.9303", rms: "0.0501" },
-    { l: 29, cold: true, gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
-    { l: 30, cold: false, gam: "0.9695-0.9702", kap: "1.0016", bw: "0.5502", ew: "0.9076", rms: "0.0513" },
-    { l: 31, cold: false, gam: "0.9697-0.9700", kap: "0.9973", bw: "0.5470", ew: "0.9012", rms: "0.0492" },
-    { l: 32, cold: false, gam: "0.9696-0.9699", kap: "0.9975", bw: "0.5115", ew: "0.8685", rms: "0.0502" },
-    { l: 33, cold: false, gam: "0.9694-0.9698", kap: "0.9906", bw: "0.5454", ew: "0.8711", rms: "0.0544" },
-    { l: 34, cold: false, gam: "0.9694-0.9699", kap: "1.0007", bw: "0.5259", ew: "0.7800", rms: "0.0540" },
-    { l: 35, cold: false, gam: "0.9693-0.9699", kap: "1.0021", bw: "0.5154", ew: "0.8225", rms: "0.0518" }
+  const LAYER_SCAN_QWEN3 = [
+    { l: 0, kind: "bolt3", gam: "0.9697-0.9698", kap: "0.9979", bw: "0.0140", ew: "0.6046", rms: "0.0505" },
+    { l: 1, kind: "bolt3", gam: "0.9695-0.9698", kap: "0.9970", bw: "0.0724", ew: "0.8206", rms: "0.0512" },
+    { l: 2, kind: "bolt3", gam: "0.9694-0.9699", kap: "0.9967", bw: "0.1441", ew: "0.9346", rms: "0.0513" },
+    { l: 3, kind: "bolt3", gam: "0.9692-0.9697", kap: "0.9968", bw: "0.3211", ew: "1.0507", rms: "0.0544" },
+    { l: 4, kind: "bolt3", gam: "0.9693-0.9698", kap: "0.9998", bw: "0.2409", ew: "0.9817", rms: "0.0547" },
+    { l: 5, kind: "bolt3", gam: "0.9692-0.9700", kap: "0.9935", bw: "0.2339", ew: "0.9659", rms: "0.0535" },
+    { l: 6, kind: "bolt3", gam: "0.9691-0.9698", kap: "0.9964", bw: "0.2549", ew: "0.9628", rms: "0.0525" },
+    { l: 7, kind: "bolt3", gam: "0.9694-0.9700", kap: "1.0015", bw: "0.4674", ew: "0.9902", rms: "0.0521" },
+    { l: 8, kind: "bolt3", gam: "0.9692-0.9699", kap: "1.0013", bw: "0.3684", ew: "0.9887", rms: "0.0533" },
+    { l: 9, kind: "bolt3", gam: "0.9691-0.9700", kap: "1.0046", bw: "0.5123", ew: "1.0945", rms: "0.0558" },
+    { l: 10, kind: "bolt3", gam: "0.9692-0.9697", kap: "1.0018", bw: "0.4706", ew: "1.0440", rms: "0.0539" },
+    { l: 11, kind: "bolt3", gam: "0.9692-0.9698", kap: "1.0032", bw: "0.4422", ew: "1.0615", rms: "0.0549" },
+    { l: 12, kind: "bolt3", gam: "0.9692-0.9697", kap: "1.0027", bw: "0.5108", ew: "1.0983", rms: "0.0553" },
+    { l: 13, kind: "bolt3", gam: "0.9692-0.9697", kap: "1.0049", bw: "0.5121", ew: "1.0641", rms: "0.0544" },
+    { l: 14, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 15, kind: "bolt3", gam: "0.9693-0.9699", kap: "0.9994", bw: "0.5045", ew: "0.9986", rms: "0.0522" },
+    { l: 16, kind: "bolt3", gam: "0.9691-0.9697", kap: "1.0001", bw: "0.5585", ew: "1.0678", rms: "0.0542" },
+    { l: 17, kind: "bolt3", gam: "0.9692-0.9698", kap: "1.0002", bw: "0.5731", ew: "1.0866", rms: "0.0536" },
+    { l: 18, kind: "bolt3", gam: "0.9694-0.9698", kap: "0.9958", bw: "0.5230", ew: "1.0127", rms: "0.0523" },
+    { l: 19, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 20, kind: "bolt3", gam: "0.9693-0.9699", kap: "1.0022", bw: "0.5372", ew: "1.0477", rms: "0.0532" },
+    { l: 21, kind: "bolt3", gam: "0.9693-0.9699", kap: "1.0010", bw: "0.5340", ew: "0.9828", rms: "0.0514" },
+    { l: 22, kind: "bolt3", gam: "0.9694-0.9699", kap: "1.0036", bw: "0.5540", ew: "0.9743", rms: "0.0518" },
+    { l: 23, kind: "bolt3", gam: "0.9696-0.9698", kap: "1.0009", bw: "0.5389", ew: "0.9675", rms: "0.0498" },
+    { l: 24, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 25, kind: "bolt3", gam: "0.9693-0.9701", kap: "1.0018", bw: "0.5567", ew: "0.9340", rms: "0.0502" },
+    { l: 26, kind: "bolt3", gam: "0.9692-0.9702", kap: "0.9986", bw: "0.5572", ew: "0.9605", rms: "0.0538" },
+    { l: 27, kind: "bolt3", gam: "0.9692-0.9700", kap: "1.0007", bw: "0.5571", ew: "0.9486", rms: "0.0533" },
+    { l: 28, kind: "bolt3", gam: "0.9696-0.9699", kap: "0.9967", bw: "0.5346", ew: "0.9303", rms: "0.0501" },
+    { l: 29, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 30, kind: "bolt3", gam: "0.9695-0.9702", kap: "1.0016", bw: "0.5502", ew: "0.9076", rms: "0.0513" },
+    { l: 31, kind: "bolt3", gam: "0.9697-0.9700", kap: "0.9973", bw: "0.5470", ew: "0.9012", rms: "0.0492" },
+    { l: 32, kind: "bolt3", gam: "0.9696-0.9699", kap: "0.9975", bw: "0.5115", ew: "0.8685", rms: "0.0502" },
+    { l: 33, kind: "bolt3", gam: "0.9694-0.9698", kap: "0.9906", bw: "0.5454", ew: "0.8711", rms: "0.0544" },
+    { l: 34, kind: "bolt3", gam: "0.9694-0.9699", kap: "1.0007", bw: "0.5259", ew: "0.7800", rms: "0.0540" },
+    { l: 35, kind: "bolt3", gam: "0.9693-0.9699", kap: "1.0021", bw: "0.5154", ew: "0.8225", rms: "0.0518" }
   ];
 
-  // Exact verified 7-task + systems scaling results
-  const TASKS = [
-    { name: "MMLU", bolt: 68.50, donor: 69.50, p: "0.790" },
-    { name: "ARC-Chall.", bolt: 56.00, donor: 54.00, p: "0.455" },
-    { name: "HellaSwag", bolt: 55.50, donor: 52.00, p: "0.118" },
-    { name: "GSM8K", bolt: 90.00, donor: 88.00, p: "0.523" },
-    { name: "HumanEval", bolt: 76.22, donor: 80.49, p: "0.230" },
-    { name: "MBPP", bolt: 53.50, donor: 55.50, p: "0.481" },
-    { name: "IFEval", bolt: 87.50, donor: 86.50, p: "0.774" }
+  // Exact verified parameter scan from bolt3_b_qwen3_5_4b_latest.pth (step=501)
+  const LAYER_SCAN_QWEN35 = [
+    { l: 0, kind: "gdn", gam: "decay_a 0.093..0.381", kap: "dt +1.293", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 1, kind: "gdn", gam: "decay_a 7.03..49.71", kap: "dt -3.237", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 2, kind: "gdn", gam: "decay_a 13.01..74.63", kap: "dt -3.829", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 3, kind: "bolt3", gam: "0.9559-0.9669", kap: "1.1439", bw: "2.6943", ew: "3.7464", rms: "0.1160" },
+    { l: 4, kind: "gdn", gam: "decay_a 3.53..18.29", kap: "dt -3.249", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 5, kind: "gdn", gam: "decay_a 2.27..20.40", kap: "dt -2.809", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 6, kind: "gdn", gam: "decay_a 3.53..54.60", kap: "dt -3.721", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 7, kind: "bolt3", gam: "0.9465-0.9622", kap: "1.2769", bw: "2.9025", ew: "3.3597", rms: "0.1459" },
+    { l: 8, kind: "gdn", gam: "decay_a 1.74..7.74", kap: "dt -3.396", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 9, kind: "gdn", gam: "decay_a 1.64..27.03", kap: "dt -3.808", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 10, kind: "gdn", gam: "decay_a 2.39..10.92", kap: "dt -4.161", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 11, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 12, kind: "gdn", gam: "decay_a 3.28..74.63", kap: "dt -3.890", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 13, kind: "gdn", gam: "decay_a 2.37..13.59", kap: "dt -3.540", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 14, kind: "gdn", gam: "decay_a 3.25..33.12", kap: "dt -3.742", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 15, kind: "bolt3", gam: "0.9440-0.9532", kap: "1.1171", bw: "2.6766", ew: "3.4359", rms: "0.1319" },
+    { l: 16, kind: "gdn", gam: "decay_a 0.75..5.04", kap: "dt -3.668", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 17, kind: "gdn", gam: "decay_a 2.62..22.06", kap: "dt -3.523", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 18, kind: "gdn", gam: "decay_a 0.92..10.92", kap: "dt -3.328", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 19, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 20, kind: "gdn", gam: "decay_a 0.47..4.73", kap: "dt -2.879", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 21, kind: "gdn", gam: "decay_a 0.33..1.79", kap: "dt -1.917", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 22, kind: "gdn", gam: "decay_a 0.29..3.20", kap: "dt -0.916", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 23, kind: "bolt3", gam: "0.9643-0.9708", kap: "0.9287", bw: "2.3640", ew: "3.5998", rms: "0.0915" },
+    { l: 24, kind: "gdn", gam: "decay_a 0.20..0.47", kap: "dt -1.439", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 25, kind: "gdn", gam: "decay_a 0.29..2.31", kap: "dt -0.862", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 26, kind: "gdn", gam: "decay_a 0.22..0.62", kap: "dt +0.226", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 27, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 28, kind: "gdn", gam: "decay_a 0.33..3.01", kap: "dt -0.069", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 29, kind: "gdn", gam: "decay_a 0.23..0.60", kap: "dt -0.173", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 30, kind: "gdn", gam: "decay_a 0.26..1.02", kap: "dt -0.976", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
+    { l: 31, kind: "bolt3", gam: "0.9540-0.9636", kap: "0.9936", bw: "2.7089", ew: "3.5899", rms: "0.1559" }
   ];
 
-  const SCALING = [
-    { ctx: 2048, label: "2k", donorMb: 288.00, boltMb: 214.82, saved: 25.4, donorTps: 59.4, boltTps: 70.4, spd: 1.19 },
-    { ctx: 8192, label: "8k", donorMb: 1152.00, boltMb: 408.06, saved: 64.6, donorTps: 58.2, boltTps: 63.5, spd: 1.09 },
-    { ctx: 16384, label: "16k", donorMb: 2304.00, boltMb: 665.72, saved: 71.1, donorTps: 59.3, boltTps: 55.5, spd: 0.94 },
-    { ctx: 32768, label: "32k", donorMb: 4608.00, boltMb: 1181.03, saved: 74.4, donorTps: 46.7, boltTps: 44.1, spd: 0.94 },
-    { ctx: 65536, label: "64k", donorMb: 9216.00, boltMb: 1186.11, saved: 87.1, donorTps: 29.6, boltTps: 44.0, spd: 1.49 }
-  ];
+  const MODELS = {
+    qwen35: {
+      eyebrow: "24 GATEDDELTANET + 8 BOLT3ATTN (3 COLD [11,19,27]) • 0 PURE SOFTMAX • QWEN/QWEN3.5-4B",
+      hfRepo: "rikkathree/bolt-qwen3.5-4b",
+      hfUrl: "https://huggingface.co/rikkathree/bolt-qwen3.5-4b",
+      donor: "Qwen/Qwen3.5-4B",
+      ckpt: "bolt3_b_qwen3_5_4b_latest.pth",
+      stats: [
+        ["4 / 4", "4-Needle NIAH (4k–32k)", "100% recall matching Donor at 4k, 16k & 32k"],
+        ["87.50%", "IFEval / MMLU 70.0%", "Donor: IFEval 87.5% • MMLU 67.5% • HumanEval 79.9%"],
+        ["-59.1%", "State RAM @ 64k (Flat >32k)", "858 MB vs 2,097 MB Donor (1.26x tok/s)"],
+        ["0.999×", "Val PPL vs Donor (KL 0.0257)", "Top1 95.06% + 4/4 Disk .vsa Recall (0.0 erase)"]
+      ],
+      layersTitle: "Inspect All 32 Layers of <code>bolt3_b_qwen3_5_4b_latest.pth</code>",
+      layersDesc: "Click any layer tile from the verified CPU parameter scan (step = 501). Green tiles are native preserved <code>GatedDeltaNet</code> layers (24/32), Flame tiles are compressed pure <code>O(1)</code> <code>Bolt3Attn</code> layers (5/32), and Gold tiles are sparse Option-B Cold-Armed <code>Bolt3Attn</code> layers (<code>[11, 19, 27]</code>).",
+      defaultLayer: 11,
+      layers: LAYER_SCAN_QWEN35,
+      benchTitle: "Verified Against <code>Qwen/Qwen3.5-4B</code> on RTX PRO 6000",
+      benchSub: "Mistral Flame = Bolt-3 Option-B • Blue = Qwen/Qwen3.5-4B Donor (HF eager GDN fallback)",
+      niahHtml: "<strong>Multi-Needle NIAH &amp; Perplexity (<code>Qwen/Qwen3.5-4B</code> Hybrid Option-B):</strong> With sparse Cold-Armed routing on just 3 of Qwen3.5's 8 attention layers (<code>[11, 19, 27]</code>) and 24 preserved <code>GatedDeltaNet</code> layers, Bolt-3.5 hits <strong>4/4 (100%) on simultaneous 4-Needle NIAH at <code>4k, 16k, and 32k</code></strong>, <strong>100% 1-Needle Passkey</strong> (<code>5.4x</code> lower batch peak VRAM @32k), <strong>1.014x FineWeb reference PPL</strong>, and <strong>100% (4/4) Disk <code>.vsa</code> Recall</strong>. (Note: On GSM8K <code>N=200</code> at 2048-token cap, Donor truncated <code>104/200</code> chains vs Bolt-3's <code>67/200</code>.)",
+      maxY: 2250,
+      maxLabel: "2.1G",
+      tasks: [
+        { name: "MMLU", bolt: 70.00, donor: 67.50, p: "0.442" },
+        { name: "ARC-Chall.", bolt: 53.50, donor: 51.50, p: "0.219" },
+        { name: "HellaSwag", bolt: 60.50, donor: 62.00, p: "0.453" },
+        { name: "GSM8K", bolt: 66.00, donor: 47.50, p: "<0.001" },
+        { name: "HumanEval", bolt: 78.66, donor: 79.88, p: "0.774" },
+        { name: "MBPP", bolt: 54.00, donor: 56.00, p: "0.344" },
+        { name: "IFEval", bolt: 87.50, donor: 87.50, p: "1.000" }
+      ],
+      scaling: [
+        { ctx: 2048, label: "2k", donorMb: 113.12, boltMb: 131.93, saved: -16.6, donorTps: 40.1, boltTps: 75.1, spd: 1.87 },
+        { ctx: 8192, label: "8k", donorMb: 305.12, boltMb: 276.44, saved: 9.4, donorTps: 39.8, boltTps: 68.9, spd: 1.73 },
+        { ctx: 16384, label: "16k", donorMb: 561.12, boltMb: 469.12, saved: 16.4, donorTps: 39.6, boltTps: 61.5, spd: 1.55 },
+        { ctx: 32768, label: "32k", donorMb: 1073.12, boltMb: 854.48, saved: 20.4, donorTps: 39.9, boltTps: 50.3, spd: 1.26 },
+        { ctx: 65536, label: "64k", donorMb: 2097.12, boltMb: 858.26, saved: 59.1, donorTps: 39.8, boltTps: 50.2, spd: 1.26 }
+      ]
+    },
+    qwen3: {
+      eyebrow: "36 / 36 BOLT3ATTN LAYERS (4 COLD [14,19,24,29]) • 0 PURE SOFTMAX • QWEN/QWEN3-4B",
+      hfRepo: "rikkathree/bolt-qwen3-4b",
+      hfUrl: "https://huggingface.co/rikkathree/bolt-qwen3-4b",
+      donor: "Qwen/Qwen3-4B",
+      ckpt: "bolt3_b_qwen3_4b_latest.pth",
+      stats: [
+        ["90.00%", "GSM8K Math (N=200)", "Donor Qwen3-4B: 88.00% (McNemar p=0.523)"],
+        ["1.49×", "Decode Speed @ 64k", "44.0 vs 29.6 tok/s (128-tok chunks)"],
+        ["-87.1%", "Live Runtime RAM @ 64k", "1,186 MB vs 9,216 MB Donor KV"],
+        ["100.0%", "1-Needle NIAH (2k–16k)", "+ 4/4 Disk .vsa Recall (0.0 erase)"]
+      ],
+      layersTitle: "Inspect All 36 Layers of <code>bolt3_b_qwen3_4b_latest.pth</code>",
+      layersDesc: "Click any layer tile from the verified CPU parameter scan (step = 100). Notice how the 32 compressed layers adapted <code>beta_proj</code> and <code>eta_proj</code> gates while the 4 sparse Cold-Armed layers stayed untouched until sequences exceed 32k overflow.",
+      defaultLayer: 14,
+      layers: LAYER_SCAN_QWEN3,
+      benchTitle: "Verified Against <code>Qwen/Qwen3-4B</code> on RTX PRO 6000",
+      benchSub: "Mistral Flame = Bolt-3 Option-B • Blue = Qwen/Qwen3-4B Donor (all p >= 0.05)",
+      niahHtml: "<strong>Needle-in-a-Haystack (WikiText-103) Diagnostic Transparency:</strong> On single-passkey retrieval (<strong>1-Needle NIAH</strong>), Qwen3-4B Option-B scored <strong>100.0% (4/4)</strong> across <code>2k, 4k, 8k, and 16k</code>. On simultaneous 4-record associative recall (<strong>4-Needle NIAH</strong>), accuracy dropped past 4k (`75% @ 4k -> 0% @ 32k`) under full 36-layer retrofit, motivating our <strong>Qwen3.5-4B</strong> hybrid release which achieves <strong>4/4 @ 32k</strong>.",
+      maxY: 9500,
+      maxLabel: "9.2G",
+      tasks: [
+        { name: "MMLU", bolt: 68.50, donor: 69.50, p: "0.790" },
+        { name: "ARC-Chall.", bolt: 56.00, donor: 54.00, p: "0.455" },
+        { name: "HellaSwag", bolt: 55.50, donor: 52.00, p: "0.118" },
+        { name: "GSM8K", bolt: 90.00, donor: 88.00, p: "0.523" },
+        { name: "HumanEval", bolt: 76.22, donor: 80.49, p: "0.230" },
+        { name: "MBPP", bolt: 53.50, donor: 55.50, p: "0.481" },
+        { name: "IFEval", bolt: 87.50, donor: 86.50, p: "0.774" }
+      ],
+      scaling: [
+        { ctx: 2048, label: "2k", donorMb: 288.00, boltMb: 214.82, saved: 25.4, donorTps: 59.4, boltTps: 70.4, spd: 1.19 },
+        { ctx: 8192, label: "8k", donorMb: 1152.00, boltMb: 408.06, saved: 64.6, donorTps: 58.2, boltTps: 63.5, spd: 1.09 },
+        { ctx: 16384, label: "16k", donorMb: 2304.00, boltMb: 665.72, saved: 71.1, donorTps: 59.3, boltTps: 55.5, spd: 0.94 },
+        { ctx: 32768, label: "32k", donorMb: 4608.00, boltMb: 1181.03, saved: 74.4, donorTps: 46.7, boltTps: 44.1, spd: 0.94 },
+        { ctx: 65536, label: "64k", donorMb: 9216.00, boltMb: 1186.11, saved: 87.1, donorTps: 29.6, boltTps: 44.0, spd: 1.49 }
+      ]
+    }
+  };
+
+  let activeModelKey = "qwen35";
+  let currentModel = MODELS.qwen35;
+  let SCALING = currentModel.scaling;
 
   // --- Decorative Mistral Mosaics ---
   const brandMosaic = document.getElementById("brand-mosaic");
@@ -507,41 +607,52 @@
     }
   }
 
-  // --- 36-Layer Interactive Grid ---
+  // --- Interactive Model Switcher + Layer Grid + 7-Task Bar Chart ---
   const layerGrid = document.getElementById("layer-grid");
+  const taskBars = document.getElementById("task-bars");
+
   function selectLayer(li) {
-    const info = LAYER_SCAN[li];
-    document.querySelectorAll(".layer-tile").forEach((el, i) => el.classList.toggle("selected", i === li));
-    document.getElementById("ld-idx").textContent = `L${String(info.l).padStart(2, "0")} ${info.cold ? "[Cold-Armed]" : "[Pure Bolt-3]"}`;
+    const layers = currentModel.layers;
+    const info = layers[li] || layers[0];
+    document.querySelectorAll(".layer-tile").forEach((el, i) => el.classList.toggle("selected", i === info.l));
+    const badge = info.kind === "cold" ? "[Cold-Armed]" : (info.kind === "gdn" ? "[GatedDeltaNet Native]" : "[Pure Bolt-3]");
+    document.getElementById("ld-idx").textContent = `L${String(info.l).padStart(2, "0")} ${badge}`;
+    document.getElementById("ld-gam-k").textContent = info.kind === "gdn" ? "Decay a Range" : "Gamma Delta Range";
+    document.getElementById("ld-kap-k").textContent = info.kind === "gdn" ? "dt_bias Mean" : "Kappa Median";
+    document.getElementById("ld-beta-k").textContent = info.kind === "gdn" ? "Backbone" : "Beta Gate |W|";
+    document.getElementById("ld-eta-k").textContent = info.kind === "gdn" ? "Mode / Status" : "Eta Gate |W|";
     document.getElementById("ld-gam").textContent = info.gam;
     document.getElementById("ld-kap").textContent = info.kap;
     document.getElementById("ld-beta").textContent = info.bw;
     document.getElementById("ld-eta").textContent = info.ew;
   }
 
-  if (layerGrid) {
-    LAYER_SCAN.forEach((row) => {
+  function renderLayers() {
+    if (!layerGrid) return;
+    layerGrid.innerHTML = "";
+    currentModel.layers.forEach((row) => {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = `layer-tile ${row.cold ? "cold" : "bolt3"}`;
-      btn.innerHTML = `L${String(row.l).padStart(2, "0")}<span class="l-tag">${row.cold ? "COLD" : `η:${row.ew}`}</span>`;
+      btn.className = `layer-tile ${row.kind}`;
+      const tag = row.kind === "cold" ? "COLD" : (row.kind === "gdn" ? "GDN" : `η:${row.ew}`);
+      btn.innerHTML = `L${String(row.l).padStart(2, "0")}<span class="l-tag">${tag}</span>`;
       btn.addEventListener("click", () => selectLayer(row.l));
       layerGrid.appendChild(btn);
     });
-    selectLayer(14);
+    selectLayer(currentModel.defaultLayer);
   }
 
-  // --- 7-Task Bar Chart ---
-  const taskBars = document.getElementById("task-bars");
-  if (taskBars) {
-    TASKS.forEach((t) => {
+  function renderTaskBars() {
+    if (!taskBars) return;
+    taskBars.innerHTML = "";
+    currentModel.tasks.forEach((t) => {
       const row = document.createElement("div");
       row.className = "task-row";
       row.innerHTML = `
         <div class="task-name">${t.name}</div>
         <div class="bar-pair">
-          <div class="bar-track"><div class="bar-fill bolt" data-w="${t.bolt}%"></div></div>
-          <div class="bar-track"><div class="bar-fill donor" data-w="${t.donor}%"></div></div>
+          <div class="bar-track"><div class="bar-fill bolt" data-w="${t.bolt}%" style="width:${t.bolt}%"></div></div>
+          <div class="bar-track"><div class="bar-fill donor" data-w="${t.donor}%" style="width:${t.donor}%"></div></div>
         </div>
         <div class="task-scores">
           <div style="color:var(--m-4)">B3: ${t.bolt.toFixed(1)}%</div>
@@ -550,17 +661,59 @@
       `;
       taskBars.appendChild(row);
     });
+  }
 
-    const barObs = new IntersectionObserver((entries) => {
-      entries.forEach((e) => {
-        if (e.isIntersecting) {
-          taskBars.querySelectorAll(".bar-fill").forEach((el) => {
-            el.style.width = el.dataset.w;
-          });
-        }
-      });
-    }, { threshold: 0.2 });
-    barObs.observe(taskBars);
+  function switchModel(key) {
+    activeModelKey = key;
+    currentModel = MODELS[key];
+    SCALING = currentModel.scaling;
+
+    const b35 = document.getElementById("model-qwen35");
+    const b3 = document.getElementById("model-qwen3");
+    if (b35 && b3) {
+      b35.classList.toggle("active", key === "qwen35");
+      b3.classList.toggle("active", key === "qwen3");
+    }
+    const ey = document.getElementById("hero-eyebrow");
+    if (ey) ey.textContent = currentModel.eyebrow;
+    const hfNav = document.getElementById("nav-hf-link");
+    if (hfNav) {
+      hfNav.href = currentModel.hfUrl;
+      hfNav.textContent = key === "qwen35" ? "HF :: Qwen3.5-4B" : "HF :: Qwen3-4B";
+    }
+    currentModel.stats.forEach((s, i) => {
+      const v = document.getElementById(`stat-v${i}`);
+      const l = document.getElementById(`stat-l${i}`);
+      const sub = document.getElementById(`stat-s${i}`);
+      if (v) v.textContent = s[0];
+      if (l) l.textContent = s[1];
+      if (sub) sub.textContent = s[2];
+    });
+    const lt = document.getElementById("layers-title");
+    const ld = document.getElementById("layers-desc");
+    if (lt) lt.innerHTML = currentModel.layersTitle;
+    if (ld) ld.innerHTML = currentModel.layersDesc;
+    const bt = document.getElementById("bench-title");
+    const bs = document.getElementById("bench-sub");
+    if (bt) bt.innerHTML = currentModel.benchTitle;
+    if (bs) bs.textContent = currentModel.benchSub;
+    const nc = document.getElementById("niah-callout");
+    if (nc) nc.innerHTML = currentModel.niahHtml;
+    const pre = document.getElementById("cli-serve-pre");
+    if (pre) {
+      pre.textContent = `python -m bolt3 scan --ckpt ${currentModel.ckpt}\npython -m bolt3 benchmark --ckpt ${currentModel.ckpt} --donor ${currentModel.donor}\npython -m bolt3 serve --ckpt ${currentModel.ckpt} --donor ${currentModel.donor} --port 8000`;
+    }
+
+    renderLayers();
+    renderTaskBars();
+    updateScaling(Number(ctxSlider ? ctxSlider.value : 4));
+  }
+
+  const btnQ35 = document.getElementById("model-qwen35");
+  const btnQ3 = document.getElementById("model-qwen3");
+  if (btnQ35 && btnQ3) {
+    btnQ35.addEventListener("click", () => switchModel("qwen35"));
+    btnQ3.addEventListener("click", () => switchModel("qwen3"));
   }
 
   // --- Context Scaling SVG + Scrubber ---
@@ -575,17 +728,18 @@
     const W = 480, H = 220, P = 42, PR = 18, PT = 18, PB = 34;
     const pw = W - P - PR, ph = H - PT - PB;
     const xPos = (i) => P + (i / (SCALING.length - 1)) * pw;
-    const yRam = (mb) => PT + ph - (mb / 9500) * ph;
+    const yRam = (mb) => PT + ph - (mb / currentModel.maxY) * ph;
 
     const donorPts = SCALING.map((d, i) => `${xPos(i).toFixed(1)},${yRam(d.donorMb).toFixed(1)}`).join(" ");
     const boltPts = SCALING.map((d, i) => `${xPos(i).toFixed(1)},${yRam(d.boltMb).toFixed(1)}`).join(" ");
     const ax = xPos(activeIdx);
     const active = SCALING[activeIdx];
+    const maxD = SCALING[SCALING.length - 1].donorMb;
 
     scalingSvg.innerHTML = `
       <line x1="${P}" y1="${PT + ph}" x2="${W - PR}" y2="${PT + ph}" stroke="rgba(255,255,255,0.18)" />
       <line x1="${P}" y1="${PT}" x2="${P}" y2="${PT + ph}" stroke="rgba(255,255,255,0.18)" />
-      <text x="${P - 6}" y="${PT + 6}" fill="#67625b" font-size="9" font-family="JetBrains Mono" text-anchor="end">9.2G</text>
+      <text x="${P - 6}" y="${PT + 6}" fill="#67625b" font-size="9" font-family="JetBrains Mono" text-anchor="end">${currentModel.maxLabel}</text>
       <text x="${P - 6}" y="${PT + ph}" fill="#67625b" font-size="9" font-family="JetBrains Mono" text-anchor="end">0</text>
       <polyline fill="none" stroke="${DONOR_BLUE}" stroke-width="2.2" stroke-dasharray="5,4" points="${donorPts}" />
       <polyline fill="none" stroke="${FLAME[2]}" stroke-width="3" points="${boltPts}" />
@@ -595,22 +749,22 @@
         <circle cx="${xPos(i)}" cy="${yRam(d.boltMb)}" r="${i === activeIdx ? 5.5 : 3.5}" fill="${FLAME[3]}" />
         <text x="${xPos(i)}" y="${H - 12}" fill="${i === activeIdx ? "#ffd93d" : "#9b958b"}" font-size="10" font-family="JetBrains Mono" text-anchor="middle">${d.label}</text>
       `).join("")}
-      <text x="${W - PR}" y="${PT + 12}" fill="${DONOR_BLUE}" font-size="10" font-family="JetBrains Mono" text-anchor="end">Donor KV (9,216 MB @64k)</text>
+      <text x="${W - PR}" y="${PT + 12}" fill="${DONOR_BLUE}" font-size="10" font-family="JetBrains Mono" text-anchor="end">Donor KV (${Math.round(maxD).toLocaleString()} MB @64k)</text>
       <text x="${W - PR}" y="${yRam(active.boltMb) - 10}" fill="#ffaf00" font-size="10" font-family="JetBrains Mono" text-anchor="end">Bolt-3 Option-B (${active.boltMb} MB)</text>
     `;
   }
 
   function updateScaling(idx) {
     const d = SCALING[idx];
+    const diffLabel = d.saved >= 0 ? `-${d.saved}%` : `+${Math.abs(d.saved)}%`;
     if (ctxReadout) ctxReadout.textContent = `${d.ctx.toLocaleString()} tok`;
-    if (scRam) scRam.textContent = `${d.boltMb.toFixed(2)} vs ${d.donorMb.toFixed(2)} MB (-${d.saved}%)`;
+    if (scRam) scRam.textContent = `${d.boltMb.toFixed(2)} vs ${d.donorMb.toFixed(2)} MB (${diffLabel})`;
     if (scSpd) scSpd.textContent = `${d.boltTps.toFixed(1)} vs ${d.donorTps.toFixed(1)} tok/s (${d.spd.toFixed(2)}x)`;
     drawScalingSvg(idx);
   }
 
   if (ctxSlider) {
     ctxSlider.addEventListener("input", () => updateScaling(Number(ctxSlider.value)));
-    updateScaling(4);
   }
 
   // --- Animation Loop ---
@@ -619,6 +773,7 @@
     renderArch(t);
     requestAnimationFrame(loop);
   }
+  switchModel("qwen35");
   setStep(0);
   computeScrollStep();
   requestAnimationFrame(loop);

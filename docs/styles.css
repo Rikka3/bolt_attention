@@ -537,6 +537,11 @@ code, pre {
   background: linear-gradient(180deg, rgba(225, 5, 0, 0.14), rgba(20, 20, 28, 0.9));
 }
 
+.layer-tile.gdn {
+  background: linear-gradient(180deg, rgba(63, 185, 80, 0.12), rgba(20, 20, 28, 0.9));
+  border-color: rgba(63, 185, 80, 0.35);
+}
+
 .layer-tile .l-tag {
   display: block;
   font-size: 0.62rem;
@@ -546,6 +551,10 @@ code, pre {
 
 .layer-tile.cold .l-tag {
   color: var(--m-4);
+}
+
+.layer-tile.gdn .l-tag {
+  color: #6ee7b7;
 }
 
 .layer-detail {
