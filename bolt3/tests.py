@@ -655,6 +655,153 @@ def test_qwen3_5_hybrid_gdn_and_packed_gate_parity():
             torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
+def test_gemma3_hybrid_norms_rope_and_gelu_parity():
+    dev = _device()
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32 if dev.type == "cuda" else None
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        torch.manual_seed(17)
+        cfg = dict(
+            vocab_size=256,
+            dim=64,
+            num_layers=4,
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=32,
+            intermediate=128,
+            max_T=256,
+            rope_theta=1_000_000.0,
+            rms_norm_eps=1e-6,
+            eps=1e-6,
+            rms_norm_offset=1.0,
+            embed_scale=8.0,
+            hidden_act="gelu_pytorch_tanh",
+            post_norms=True,
+            query_pre_attn_scalar=32.0,
+            qk_norm=True,
+            bolt3_S=16,
+            bolt3_C=16,
+            bolt3_n_sinks=4,
+            bolt3_cold_layers=[3],
+            bolt3_max_cold_blocks=4,
+            layer_roles=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+            layer_rope_thetas=[10_000.0, 10_000.0, 10_000.0, 1_000_000.0],
+            layer_rope_scalings=[None, None, None, {"rope_type": "linear", "factor": 8.0}],
+            layer_sliding_windows=[32, 32, 32, None],
+        )
+        m = Bolt3LM(**cfg).to(dev).float().eval()
+        with torch.no_grad():
+            for blk in m.blocks:
+                blk.attn.eta_proj.bias.fill_(0.35)
+                blk.attn.res_norm.weight.fill_(0.5)
+                blk.post_attn_norm.weight.fill_(0.1)
+                blk.post_mlp_norm.weight.fill_(0.15)
+
+        x = torch.randint(1, 256, (1, 70), device=dev)
+        with torch.no_grad():
+            h_fwd = m(x)
+            dec = Bolt3Decoder(m)
+            hp, st, kv = dec.prefill(x[:, :37])
+            outs = [hp]
+            for pos in range(37, 70):
+                hs, st, kv = dec.step(x[:, pos : pos + 1], pos, st, kv)
+                outs.append(hs)
+            h_dec = torch.cat(outs, dim=1)
+            dec.close()
+            diff = float((h_fwd - h_dec).abs().max().item())
+        tol = 5e-2 if dev.type == "cuda" else 1e-4
+        assert diff < tol, f"gemma3 forward vs decode diff={diff}"
+
+        # Autograd gradients through scaled embeddings, gelu_pytorch_tanh MLP, and post-norms
+        m.train()
+        loss = m(torch.randint(0, 256, (2, 70), device=dev)).pow(2).mean()
+        loss.backward()
+        assert m.blocks[0].post_attn_norm.weight.grad is not None
+        assert m.blocks[0].post_mlp_norm.weight.grad is not None
+        assert m.blocks[3].attn.log_gamma.grad is not None
+        m.eval()
+
+        # Left-padded batch parity with multi-group RoPE
+        dec_b = Bolt3Decoder(m)
+        p1 = torch.randint(1, 256, (1, 5), device=dev)
+        p2 = torch.randint(1, 256, (1, 45), device=dev)
+        ids_b = torch.zeros((2, 45), dtype=torch.long, device=dev)
+        mask_b = torch.zeros((2, 45), dtype=torch.long, device=dev)
+        ids_b[0, 40:] = p1[0]
+        mask_b[0, 40:] = 1
+        ids_b[1] = p2[0]
+        mask_b[1] = 1
+        with torch.no_grad():
+            ref1 = dec_b.generate(p1, 20, temperature=0.0)[0, 5:].tolist()
+            ref2 = dec_b.generate(p2, 20, temperature=0.0)[0, 45:].tolist()
+            bat, _ = dec_b.generate_batch(ids_b, 20, temperature=0.0, attn_mask=mask_b)
+            assert bat[0].tolist() == ref1 and bat[1].tolist() == ref2
+        dec_b.close()
+
+        # SoftmaxAttn teacher replica sanity with sliding window & linear RoPE scaling
+        rep_cfg = dict(cfg, layer_types=["softmax"] * 4)
+        mt = Bolt3LM(**rep_cfg).to(dev).float().eval()
+        dec_t = Bolt3Decoder(mt)
+        with torch.no_grad():
+            ht_p = mt(x)
+            ht_d, st_t, kv_t = dec_t.prefill(x[:, :37])
+            outs_t = [ht_d]
+            for pos in range(37, 70):
+                ht_s, st_t, kv_t = dec_t.step(x[:, pos : pos + 1], pos, st_t, kv_t)
+                outs_t.append(ht_s)
+            diff_t = float((ht_p - torch.cat(outs_t, dim=1)).abs().max().item())
+            dec_t.close()
+        assert diff_t < tol, f"gemma3 softmax teacher parity diff={diff_t}"
+
+        bf16_msg = "cpu-skip"
+        if dev.type == "cuda":
+            d_cg_f = Bolt3Decoder(m, use_cuda_graph=True)
+            d_eg_f = Bolt3Decoder(m, use_cuda_graph=False)
+            with torch.no_grad():
+                xc = torch.randint(1, 256, (1, 90), device=dev)
+                hc_f, sc_cf, kvc_f = d_cg_f.prefill(xc[:, :20])
+                he_f, se_ef, kve_f = d_eg_f.prefill(xc[:, :20])
+                oc_f, oe_f = [hc_f], [he_f]
+                for p in range(20, 90):
+                    hc_f, sc_cf, kvc_f = d_cg_f.step(xc[:, p : p + 1], p, sc_cf, kvc_f)
+                    he_f, se_ef, kve_f = d_eg_f.step(xc[:, p : p + 1], p, se_ef, kve_f)
+                    oc_f.append(hc_f)
+                    oe_f.append(he_f)
+                d_f32 = float((torch.cat(oc_f, dim=1) - torch.cat(oe_f, dim=1)).abs().max().item())
+            d_cg_f.close()
+            d_eg_f.close()
+            assert d_f32 < 1e-4, f"gemma3 fp32 graph vs eager diff={d_f32}"
+
+            m_bf = Bolt3LM(**cfg).to(dev).to(torch.bfloat16).eval()
+            for n, p in m_bf.named_parameters():
+                if any(k in n for k in ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm")):
+                    p.data = p.data.float()
+            d_cg = Bolt3Decoder(m_bf, use_cuda_graph=True)
+            d_eg = Bolt3Decoder(m_bf, use_cuda_graph=False)
+            with torch.no_grad():
+                hc, sc_c, kvc = d_cg.prefill(xc[:, :20])
+                he, se, kve = d_eg.prefill(xc[:, :20])
+                oc, oe = [hc], [he]
+                for p in range(20, 90):
+                    hc, sc_c, kvc = d_cg.step(xc[:, p : p + 1], p, sc_c, kvc)
+                    he, se, kve = d_eg.step(xc[:, p : p + 1], p, se, kve)
+                    oc.append(hc)
+                    oe.append(he)
+                tc, te = torch.cat(oc, dim=1), torch.cat(oe, dim=1)
+                d_bf = float((tc - te).abs().max().item())
+                rel_bf = float(((tc - te).abs() / te.abs().clamp_min(1.0)).max().item())
+            d_cg.close()
+            d_eg.close()
+            assert rel_bf < 2e-2, f"gemma3 bf16 graph vs eager rel_diff={rel_bf} (abs={d_bf})"
+            bf16_msg = f"{d_bf:.2e}(rel={rel_bf:.2e})"
+
+        print(f"[gemma3 norms+rope+gelu]   fwd_vs_dec={diff:.2e}  batch=exact  teacher={diff_t:.2e}  bf16_graph={bf16_msg}")
+    finally:
+        if old_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
 def run_all():
     print(f"Running Bolt-3 test suite on {_device()}...")
     test_forward_decode_parity()
@@ -665,6 +812,7 @@ def run_all():
     test_left_padded_batch_parity()
     test_cold_armed_parity()
     test_qwen3_5_hybrid_gdn_and_packed_gate_parity()
+    test_gemma3_hybrid_norms_rope_and_gelu_parity()
     print("ALL BOLT-3 TESTS PASSED")
 
 

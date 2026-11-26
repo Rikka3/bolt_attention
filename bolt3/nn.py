@@ -54,20 +54,33 @@ def inv_freq_for_rope(
     inv = 1.0 / (
         theta ** (torch.arange(0, rot_dim, 2, dtype=torch.int64, device=device).float() / rot_dim)
     )
-    if rope_scaling and rope_scaling.get("rope_type") == "llama3":
-        old_ctx = float(rope_scaling["original_max_position_embeddings"])
-        factor = float(rope_scaling["factor"])
-        low = float(rope_scaling["low_freq_factor"])
-        high = float(rope_scaling["high_freq_factor"])
-        low_wl = old_ctx / low
-        high_wl = old_ctx / high
-        wavelen = 2.0 * math.pi / inv
-        inv_a = torch.where(wavelen > low_wl, inv / factor, inv)
-        smooth = (old_ctx / wavelen - low) / (high - low)
-        smoothed = (1.0 - smooth) * inv_a / factor + smooth * inv_a
-        medium = ~(wavelen < high_wl) & ~(wavelen > low_wl)
-        inv = torch.where(medium, smoothed, inv_a)
+    if rope_scaling:
+        rtype = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        if rtype == "linear":
+            inv = inv / float(rope_scaling.get("factor", 1.0))
+        elif rtype == "llama3":
+            old_ctx = float(rope_scaling["original_max_position_embeddings"])
+            factor = float(rope_scaling["factor"])
+            low = float(rope_scaling["low_freq_factor"])
+            high = float(rope_scaling["high_freq_factor"])
+            low_wl = old_ctx / low
+            high_wl = old_ctx / high
+            wavelen = 2.0 * math.pi / inv
+            inv_a = torch.where(wavelen > low_wl, inv / factor, inv)
+            smooth = (old_ctx / wavelen - low) / (high - low)
+            smoothed = (1.0 - smooth) * inv_a / factor + smooth * inv_a
+            medium = ~(wavelen < high_wl) & ~(wavelen > low_wl)
+            inv = torch.where(medium, smoothed, inv_a)
     return inv, rot_dim
+
+
+def layer_rope_params(cfg: dict, layer_idx: int) -> tuple[float, dict | None]:
+    """Return per-layer `(rope_theta, rope_scaling)` supporting hybrid local/global configs like Gemma-3."""
+    thetas = cfg.get("layer_rope_thetas")
+    scalings = cfg.get("layer_rope_scalings")
+    theta = float(thetas[layer_idx]) if (thetas and layer_idx < len(thetas)) else float(cfg["rope_theta"])
+    scaling = scalings[layer_idx] if (scalings and layer_idx < len(scalings)) else cfg.get("rope_scaling")
+    return theta, scaling
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -137,24 +150,36 @@ class SwiGLUMLP(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         D, I = int(cfg["dim"]), int(cfg["intermediate"])
+        self.hidden_act = str(cfg.get("hidden_act", "silu")).lower()
         self.gate_proj = nn.Linear(D, I, bias=False)
         self.up_proj = nn.Linear(D, I, bias=False)
         self.down_proj = nn.Linear(I, D, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        g = self.gate_proj(x)
+        if self.hidden_act in ("gelu_pytorch_tanh", "gelu_new"):
+            act = F.gelu(g, approximate="tanh")
+        elif self.hidden_act == "gelu":
+            act = F.gelu(g)
+        else:
+            act = F.silu(g)
+        return self.down_proj(act * self.up_proj(x))
 
 
 class SoftmaxAttn(nn.Module):
     """Standard causal Softmax attention used for donor teacher replicas."""
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, layer_idx: int = 0):
         super().__init__()
         D, H, HKV = int(cfg["dim"]), int(cfg["num_heads"]), int(cfg["num_kv_heads"])
         HD = int(cfg.get("head_dim") or (D // H))
         qkv_bias = bool(cfg.get("qkv_bias", False))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
         self.packed_q_gate = bool(cfg.get("packed_q_gate", False))
+        q_scalar = cfg.get("query_pre_attn_scalar")
+        self.attn_scale = (float(q_scalar) ** -0.5) if q_scalar is not None else (HD ** -0.5)
+        sws = cfg.get("layer_sliding_windows")
+        self.sliding_window = int(sws[layer_idx]) if (sws and layer_idx < len(sws) and sws[layer_idx]) else None
 
         q_out_dim = (H * HD * 2) if self.packed_q_gate else (H * HD)
         self.q_proj = nn.Linear(D, q_out_dim, bias=qkv_bias)
@@ -174,10 +199,11 @@ class SoftmaxAttn(nn.Module):
             if (cfg.get("softmax_gate", False) and not self.packed_q_gate)
             else None
         )
+        r_theta, r_scaling = layer_rope_params(cfg, int(layer_idx))
         self.rope = RoPE(
             HD,
-            float(cfg["rope_theta"]),
-            cfg.get("rope_scaling"),
+            r_theta,
+            r_scaling,
             float(cfg.get("partial_rotary_factor", 1.0)),
         )
 
@@ -203,10 +229,21 @@ class SoftmaxAttn(nn.Module):
         B, T, _ = x.shape
         q, k, v, gate = self.head_qkv_gate(x)
         q, k = self.rope(q), self.rope(k)
+        attn_mask = None
+        is_causal = True
+        if self.sliding_window is not None and T > self.sliding_window:
+            qi = torch.arange(T, device=x.device)[:, None]
+            kj = torch.arange(T, device=x.device)[None, :]
+            attn_mask = (kj <= qi) & (kj > (qi - self.sliding_window))
+            is_causal = False
         try:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=(self.G > 1))
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.attn_scale, enable_gqa=(self.G > 1)
+            )
         except TypeError:
-            y = F.scaled_dot_product_attention(q, repeat_kv(k, self.G), repeat_kv(v, self.G), is_causal=True)
+            y = F.scaled_dot_product_attention(
+                q, repeat_kv(k, self.G), repeat_kv(v, self.G), attn_mask=attn_mask, is_causal=is_causal, scale=self.attn_scale
+            )
         out = y.transpose(1, 2).reshape(B, T, self.H * self.HD)
         if gate is not None:
             out = out * torch.sigmoid(gate)

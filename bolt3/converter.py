@@ -45,6 +45,7 @@ def _resolve_cold_layers(
     spec: list[int] | tuple[int, ...] | str | None,
     num_layers: int,
     layer_types: list[str] | None = None,
+    layer_roles: list[str] | None = None,
 ) -> list[int]:
     if not spec:
         return []
@@ -53,6 +54,15 @@ def _resolve_cold_layers(
         if layer_types
         else list(range(num_layers))
     )
+    if (
+        isinstance(spec, str)
+        and spec.strip().lower() in ("auto3", "auto4", "auto6")
+        and layer_roles
+        and ("full_attention" in layer_roles and "sliding_attention" in layer_roles)
+    ):
+        global_b3 = [i for i in b3_idxs if i < len(layer_roles) and layer_roles[i] == "full_attention"]
+        if len(global_b3) >= 3:
+            b3_idxs = global_b3
     if isinstance(spec, str):
         s = spec.strip().lower()
         if not s or s in ("none", "off", "0"):
@@ -109,7 +119,9 @@ def convert_donor_model(
         bolt3_max_cold_blocks=max_cold_blocks,
         bolt3_cold_topk=cold_topk,
     )
-    resolved_cold = _resolve_cold_layers(cold_layers, int(cfg["num_layers"]), cfg.get("layer_types"))
+    resolved_cold = _resolve_cold_layers(
+        cold_layers, int(cfg["num_layers"]), cfg.get("layer_types"), cfg.get("layer_roles")
+    )
     cfg["bolt3_cold_layers"] = resolved_cold
 
     L = cfg["num_layers"]
@@ -523,17 +535,24 @@ def _stage1_attention_transfer(
                     with torch.no_grad():
                         h_n = blk.norm1(xs)
                         a_tgt = donor.blocks[li].attn(h_n)
+                    p_an = getattr(blk, "post_attn_norm", None)
+                    p_mn = getattr(blk, "post_mlp_norm", None)
                     if li in bolt3_set:
                         a_hat = blk.attn(h_n)
                         loss_li = _attn_transfer_loss(a_hat, a_tgt) / len(bolt3_indices)
                         loss_li.backward()
                         total_loss = total_loss + loss_li.detach()
-                        xs = xs + a_hat.detach()
+                        a_res = p_an(a_hat.detach()) if p_an is not None else a_hat.detach()
+                        xs = xs + a_res
                         del a_hat, loss_li
                     else:
-                        xs = xs + a_tgt
+                        a_res = p_an(a_tgt) if p_an is not None else a_tgt
+                        xs = xs + a_res
                     with torch.no_grad():
-                        xs = xs + blk.mlp(blk.norm2(xs))
+                        m_out = blk.mlp(blk.norm2(xs))
+                        if p_mn is not None:
+                            m_out = p_mn(m_out)
+                        xs = xs + m_out
                     del a_tgt
             del xs
         else:
@@ -546,8 +565,11 @@ def _stage1_attention_transfer(
                     if li in bolt3_indices:
                         norm_inputs[li] = h_n.detach()
                         attn_targets[li] = a_out.detach()
-                    xt = xt + a_out
-                    xt = xt + blk.mlp(blk.norm2(xt))
+                    p_an = getattr(blk, "post_attn_norm", None)
+                    p_mn = getattr(blk, "post_mlp_norm", None)
+                    xt = xt + (p_an(a_out) if p_an is not None else a_out)
+                    m_out = blk.mlp(blk.norm2(xt))
+                    xt = xt + (p_mn(m_out) if p_mn is not None else m_out)
             with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
                 for li, h_n in norm_inputs.items():
                     a_hat = stu.blocks[li].attn(h_n)
@@ -585,7 +607,7 @@ def _setup_trainable(
         elif in_b3 and ".attn." in n_ and not freeze_proj:
             p_.requires_grad_(True)
             bolt3_proj.append(p_)
-        elif not freeze_mlp and (".mlp." in n_ or ".norm1." in n_ or ".norm2." in n_):
+        elif not freeze_mlp and (".mlp." in n_ or ".norm1." in n_ or ".norm2." in n_ or ".post_attn_norm." in n_ or ".post_mlp_norm." in n_):
             p_.requires_grad_(True)
             mlp_and_norm.append(p_)
         else:
@@ -791,12 +813,17 @@ def heal_bolt3_model(
     T = int(stu_cfg["max_T"])
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1024**3) if device.type == "cuda" else 16.0
 
-    # Auto-tune activation checkpointing for 48 GB / 96 GB RTX 6000 Pro vs smaller GPUs
-    if highspeed and vram_gb >= 80.0 and freeze_mlp and T <= 2048:
+    # Auto-tune activation checkpointing for 48 GB / 96 GB RTX 6000 Pro vs large models / smaller GPUs
+    if highspeed and vram_gb >= 80.0 and freeze_mlp and T <= 2048 and n_params < 7_000_000_000:
         micro_bs = 2
         use_ckpt = False
         eff_stride = 1
         mode_str = f"RTX-96GB HIGHSPEED (use_ckpt=False, micro_bs={micro_bs}, T={T})"
+    elif highspeed and vram_gb >= 80.0 and freeze_mlp and T <= 2048:
+        micro_bs = 1 if train_proj else 2
+        use_ckpt = True
+        eff_stride = 1 if train_proj else 2
+        mode_str = f"RTX-96GB LARGE-CKPT (use_ckpt=True, stride={eff_stride}, micro_bs={micro_bs}, T={T})"
     elif highspeed and vram_gb >= 44.0 and freeze_mlp and T <= 2048:
         micro_bs = 2
         use_ckpt = True

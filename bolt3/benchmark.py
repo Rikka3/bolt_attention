@@ -903,6 +903,8 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
             except Exception:
                 hf_cache_cls = None
 
+        layer_sws = cfg.get("layer_sliding_windows")
+
         def _make_donor_cache(t_ctx: int):
             if hf_cache_cls is not None:
                 c = hf_cache_cls(config=inner_hf.config)
@@ -913,9 +915,11 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
                     c = DynamicCache()
             for li in range(L):
                 if not is_hybrid or layer_types[li] != "linear_attention":
+                    sw_li = layer_sws[li] if (layer_sws and li < len(layer_sws)) else None
+                    eff_t = min(t_ctx, int(sw_li)) if sw_li else t_ctx
                     c.update(
-                        torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
-                        torch.randn(1, HKV, t_ctx, HD, device=device, dtype=torch.bfloat16),
+                        torch.randn(1, HKV, eff_t, HD, device=device, dtype=torch.bfloat16),
+                        torch.randn(1, HKV, eff_t, HD, device=device, dtype=torch.bfloat16),
                         li,
                     )
             return c
@@ -945,7 +949,15 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
             bolt3_tok_s = statistics.median(runs_s)
             torch.cuda.empty_cache()
 
-            donor_kv_mb = (n_full_donor * 2 * HKV * HD * T_c * 2 + lin_donor_bytes) / (1024 ** 2)
+            if layer_sws:
+                kv_bytes = sum(
+                    2 * HKV * HD * (min(T_c, int(layer_sws[li])) if (li < len(layer_sws) and layer_sws[li]) else T_c) * 2
+                    for li in range(L)
+                    if not is_hybrid or layer_types[li] != "linear_attention"
+                )
+            else:
+                kv_bytes = n_full_donor * 2 * HKV * HD * T_c * 2
+            donor_kv_mb = (kv_bytes + lin_donor_bytes) / (1024 ** 2)
             cache_hf = _make_donor_cache(T_c)
             with torch.autocast("cuda", torch.bfloat16):
                 o_w = inner_hf(input_ids=nxt_tok, past_key_values=cache_hf, use_cache=True)

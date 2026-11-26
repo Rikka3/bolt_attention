@@ -22,7 +22,7 @@ def get_all_eos_ids(tokenizer) -> set[int]:
             eos_ids.update(int(x) for x in tokenizer.eos_token_id)
         else:
             eos_ids.add(int(tokenizer.eos_token_id))
-    for tok_str in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<｜end▁of▁sentence｜>", "</s>"):
+    for tok_str in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<｜end▁of▁sentence｜>", "<end_of_turn>", "<eos>", "</s>"):
         try:
             tid = tokenizer.convert_tokens_to_ids(tok_str)
             if isinstance(tid, int) and tid >= 0 and tid != getattr(tokenizer, "unk_token_id", -1):

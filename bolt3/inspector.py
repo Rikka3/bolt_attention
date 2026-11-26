@@ -19,7 +19,9 @@ def fetch_any_donor(repo_or_dir: str, hf_token: str | None = None) -> str:
         "*.safetensors",
         "model.safetensors.index.json",
         "tokenizer.json",
+        "tokenizer.model",
         "tokenizer_config.json",
+        "added_tokens.json",
         "special_tokens_map.json",
         "vocab.json",
         "merges.txt",
@@ -38,9 +40,19 @@ def load_all_safetensors(donor_dir: str) -> dict[str, torch.Tensor]:
     sd = {}
     for sh in shards:
         for k, v in load_file(sh).items():
-            if k.startswith("visual.") or k.startswith("model.visual.") or ".visual." in k:
+            if any(
+                tag in k
+                for tag in (
+                    "visual.",
+                    "vision_tower.",
+                    "multi_modal_projector.",
+                    "mtp.",
+                )
+            ) and not k.startswith(("model.layers.", "language_model.model.layers.")):
                 continue
-            if k.startswith("mtp.") or ".mtp." in k:
+            if k.startswith(("visual.", "model.visual.", "mtp.")) or ".visual." in k or ".mtp." in k:
+                continue
+            if k.startswith(("vision_tower.", "model.vision_tower.", "multi_modal_projector.", "model.multi_modal_projector.")):
                 continue
             if k.startswith("model.language_model."):
                 k = "model." + k[len("model.language_model.") :]
@@ -103,7 +115,43 @@ def inspect_donor_config(
         layer_types = ["bolt3"] * num_layers
 
     mtype = str(hc.get("model_type") or raw_cfg.get("model_type") or "").lower()
-    rms_norm_offset = 1.0 if mtype in ("qwen3_5", "qwen3_5_text") else 0.0
+    is_gemma = mtype in ("gemma", "gemma2", "gemma3", "gemma3_text")
+    rms_norm_offset = 1.0 if (is_gemma or mtype in ("qwen3_5", "qwen3_5_text")) else 0.0
+    embed_scale = float(dim ** 0.5) if is_gemma else 1.0
+    hidden_act = str(hc.get("hidden_activation") or hc.get("hidden_act") or "silu")
+    post_norms = any(k.endswith(".pre_feedforward_layernorm.weight") for k in hf_sd)
+    q_scalar = hc.get("query_pre_attn_scalar")
+    query_pre_attn_scalar = float(q_scalar) if q_scalar is not None else None
+
+    sw_pat = hc.get("sliding_window_pattern")
+    sw_val = hc.get("sliding_window")
+    raw_roles = hc.get("layer_types")
+    if raw_roles is None and sw_pat and int(sw_pat) > 1:
+        pat = int(sw_pat)
+        raw_roles = ["sliding_attention" if bool((i + 1) % pat) else "full_attention" for i in range(num_layers)]
+
+    layer_rope_thetas = None
+    layer_rope_scalings = None
+    layer_sliding_windows = None
+    layer_roles = None
+    if raw_roles and ("sliding_attention" in raw_roles and "full_attention" in raw_roles):
+        layer_roles = list(raw_roles)
+        sl_rp = rope_params.get("sliding_attention") if isinstance(rope_params.get("sliding_attention"), dict) else {}
+        fl_rp = rope_params.get("full_attention") if isinstance(rope_params.get("full_attention"), dict) else {}
+        sl_theta = float(hc.get("rope_local_base_freq", sl_rp.get("rope_theta", 10000.0)))
+        fl_theta = float(fl_rp.get("rope_theta", rope_theta))
+        fl_scaling = rope_scaling if rope_scaling is not None else (
+            {k: v for k, v in fl_rp.items() if k != "rope_theta"} if fl_rp.get("rope_type", "default") != "default" else None
+        )
+        sl_scaling = (
+            {k: v for k, v in sl_rp.items() if k != "rope_theta"}
+            if sl_rp.get("rope_type", "default") != "default"
+            else None
+        )
+        sw_int = int(sw_val) if sw_val else None
+        layer_rope_thetas = [sl_theta if r == "sliding_attention" else fl_theta for r in layer_roles]
+        layer_rope_scalings = [sl_scaling if r == "sliding_attention" else fl_scaling for r in layer_roles]
+        layer_sliding_windows = [sw_int if r == "sliding_attention" else None for r in layer_roles]
 
     cfg_out = dict(
         donor_arch=raw_cfg.get("model_type", hc.get("model_type", "unknown")),
@@ -120,6 +168,10 @@ def inspect_donor_config(
         rope_scaling=rope_scaling,
         eps=eps,
         rms_norm_offset=rms_norm_offset,
+        embed_scale=embed_scale,
+        hidden_act=hidden_act,
+        post_norms=post_norms,
+        query_pre_attn_scalar=query_pre_attn_scalar,
         qkv_bias=has_qkv_bias,
         qk_norm=has_qk_norm,
         packed_q_gate=packed_q_gate,
@@ -137,6 +189,13 @@ def inspect_donor_config(
         bolt3_cold_topk=int(bolt3_cold_topk),
         layer_types=layer_types,
     )
+    if layer_roles is not None:
+        cfg_out.update(
+            layer_roles=layer_roles,
+            layer_rope_thetas=layer_rope_thetas,
+            layer_rope_scalings=layer_rope_scalings,
+            layer_sliding_windows=layer_sliding_windows,
+        )
     if "linear_attention" in layer_types:
         cfg_out.update(
             linear_conv_kernel_dim=int(hc.get("linear_conv_kernel_dim", 4)),
@@ -153,6 +212,7 @@ def map_hf_to_bolt3(hf_sd: dict[str, torch.Tensor], cfg: dict, target_attn: str 
     sd: dict[str, torch.Tensor] = {}
     H, HD, D = int(cfg["num_heads"]), int(cfg["head_dim"]), int(cfg["dim"])
     keep_gate = bool(cfg.get("packed_q_gate", False))
+    use_post_norms = bool(cfg.get("post_norms", False))
 
     for k, t in hf_sd.items():
         if k == "model.embed_tokens.weight":
@@ -198,8 +258,13 @@ def map_hf_to_bolt3(hf_sd: dict[str, torch.Tensor], cfg: dict, target_attn: str 
                     sd[f"blocks.{li}.attn.{sub_name}"] = t.detach().cpu().clone()
             elif sub == "input_layernorm.weight":
                 sd[f"blocks.{li}.norm1.weight"] = t.detach().cpu().clone()
-            elif sub == "post_attention_layernorm.weight":
+            elif sub == "pre_feedforward_layernorm.weight":
                 sd[f"blocks.{li}.norm2.weight"] = t.detach().cpu().clone()
+            elif sub == "post_attention_layernorm.weight":
+                key_dst = f"blocks.{li}.post_attn_norm.weight" if use_post_norms else f"blocks.{li}.norm2.weight"
+                sd[key_dst] = t.detach().cpu().clone()
+            elif sub == "post_feedforward_layernorm.weight" and use_post_norms:
+                sd[f"blocks.{li}.post_mlp_norm.weight"] = t.detach().cpu().clone()
             elif sub in ("mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"):
                 sd[f"blocks.{li}.{sub}"] = t.detach().cpu().clone()
 

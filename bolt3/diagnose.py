@@ -80,15 +80,18 @@ def student_drift(
     dec = Bolt3Decoder(stu)
     eos_ids = get_all_eos_ids(tok)
     kls, nlls, lens = [], [], []
-    for i, p in enumerate(prompts):
-        torch.manual_seed(seed + i)
-        x = torch.tensor([tok.encode(p, add_special_tokens=False)], dtype=torch.long, device=device)
-        toks, n = dec.generate_batch(x, max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids)
-        n = int(n[0])
-        lens.append(n)
-        kl, nll, _ = score_continuation(s_fn, t_fn, torch.cat([x, toks[:, :n]], dim=1), x.shape[1], device)
-        kls.append(kl)
-        nlls.append(nll)
+    try:
+        for i, p in enumerate(prompts):
+            torch.manual_seed(seed + i)
+            x = torch.tensor([tok.encode(p, add_special_tokens=False)], dtype=torch.long, device=device)
+            toks, n = dec.generate_batch(x, max_new, temperature=temperature, top_p=top_p, eos_ids=eos_ids)
+            n = int(n[0])
+            lens.append(n)
+            kl, nll, _ = score_continuation(s_fn, t_fn, torch.cat([x, toks[:, :n]], dim=1), x.shape[1], device)
+            kls.append(kl)
+            nlls.append(nll)
+    finally:
+        dec.close()
     return {
         "kl": _bucketize(kls),
         "teacher_nll": _bucketize(nlls),
@@ -125,7 +128,7 @@ def teacher_forced_drift(
             temperature=temperature,
             top_p=top_p,
             eos_token_id=eos_ids,
-            pad_token_id=tok.eos_token_id or 0,
+            pad_token_id=(tok.pad_token_id if isinstance(tok.pad_token_id, int) else (tok.eos_token_id if isinstance(tok.eos_token_id, int) else 0)),
         )
         lens.append(out.shape[1] - x.shape[1])
         kl, nll, agree = score_continuation(s_fn, t_fn, out, x.shape[1], device)
@@ -183,19 +186,22 @@ def layer_parity(stu, tok, device, T: int = 1024) -> list[dict]:
     states, kv = Bolt3Decoder.blank_state(stu, 1, device, max_kv_len=T + 64)
     edges = [e for e in (0, 128, 256, 384, 1024, 2048) if e < T] + [T]
     rows = []
-    for li, blk in enumerate(stu.blocks):
-        rec = torch.empty_like(outs[li])
-        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-            for t in range(T):
-                rec[:, t : t + 1] = dec.step_block(li, blk, ins[li][:, t : t + 1], t, states, kv)
-        ref_d = (outs[li] - ins[li]).float()
-        rec_d = (rec - ins[li]).float()
-        err = ((rec_d - ref_d).norm(dim=-1) / ref_d.norm(dim=-1).clamp_min(1e-6))[0]
-        row = {"layer": li, "type": "bolt3" if isinstance(blk.attn, Bolt3Attn) else "gdn"}
-        for lo, hi in zip(edges[:-1], edges[1:]):
-            row[f"{lo}-{hi}"] = round(float(err[lo:hi].mean()), 4)
-        rows.append(row)
-        del rec, ref_d, rec_d
+    try:
+        for li, blk in enumerate(stu.blocks):
+            rec = torch.empty_like(outs[li])
+            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+                for t in range(T):
+                    rec[:, t : t + 1] = dec.step_block(li, blk, ins[li][:, t : t + 1], t, states, kv)
+            ref_d = (outs[li] - ins[li]).float()
+            rec_d = (rec - ins[li]).float()
+            err = ((rec_d - ref_d).norm(dim=-1) / ref_d.norm(dim=-1).clamp_min(1e-6))[0]
+            row = {"layer": li, "type": "bolt3" if isinstance(blk.attn, Bolt3Attn) else "gdn"}
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                row[f"{lo}-{hi}"] = round(float(err[lo:hi].mean()), 4)
+            rows.append(row)
+            del rec, ref_d, rec_d
+    finally:
+        dec.close()
     return rows
 
 
@@ -210,12 +216,15 @@ def decode_parity(stu, tok, device, T: int = 3072) -> list[dict]:
     dec = Bolt3Decoder(stu)
     states, kv = Bolt3Decoder.blank_state(stu, 1, device, max_kv_len=T + 64)
     max_diff, agree = torch.zeros(T), torch.zeros(T)
-    for t in range(T):
-        h, states, kv = dec.step(x[:, t : t + 1], t, states, kv)
-        rec = stu.lm_head(h[:, -1])[0].float()
-        ref = par[t].float()
-        max_diff[t] = (rec - ref).abs().max().item()
-        agree[t] = float(rec.argmax() == ref.argmax())
+    try:
+        for t in range(T):
+            h, states, kv = dec.step(x[:, t : t + 1], t, states, kv)
+            rec = stu.lm_head(h[:, -1])[0].float()
+            ref = par[t].float()
+            max_diff[t] = (rec - ref).abs().max().item()
+            agree[t] = float(rec.argmax() == ref.argmax())
+    finally:
+        dec.close()
 
     out = []
     for lo, hi in zip(PARITY_EDGES[:-1], PARITY_EDGES[1:]):

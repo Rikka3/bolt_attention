@@ -30,7 +30,7 @@ def _donor_generate(donor, tok, x: torch.Tensor, max_new: int, eos_ids, temperat
         temperature=temperature if sample else None,
         top_p=top_p if sample else None,
         eos_token_id=sorted(eos_ids) or None,
-        pad_token_id=tok.eos_token_id if isinstance(tok.eos_token_id, int) else 0,
+        pad_token_id=(tok.pad_token_id if isinstance(tok.pad_token_id, int) else (tok.eos_token_id if isinstance(tok.eos_token_id, int) else 0)),
     )
     toks = out[:, x.shape[1] :]
     hit = torch.isin(toks, torch.tensor(sorted(eos_ids), dtype=torch.long, device=toks.device))

@@ -15,11 +15,29 @@ from .nn import GatedDeltaNet, RMSNorm, SoftmaxAttn, SwiGLUMLP
 FP32_KEYS = ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm", "A_log", "dt_bias")
 
 
+class ScaledEmbedding(nn.Embedding):
+    """Embedding layer that preserves standard `weight` key while supporting scalar output scaling (Gemma)."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, embed_scale: float = 1.0):
+        super().__init__(num_embeddings, embedding_dim)
+        self.embed_scale = float(embed_scale)
+        self.register_buffer("_embed_scale_t", torch.tensor(float(embed_scale), dtype=torch.float32), persistent=False)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        out = super().forward(input_ids)
+        if self.embed_scale != 1.0:
+            sc = self._embed_scale_t.to(dtype=out.dtype) if self._embed_scale_t.device == out.device else self._embed_scale_t.to(device=out.device, dtype=out.dtype)
+            return out * sc
+        return out
+
+
 class Bolt3Block(nn.Module):
     def __init__(self, cfg: dict, layer_type: str = "bolt3", layer_idx: int = 0):
         super().__init__()
         norm_off = float(cfg.get("rms_norm_offset", 0.0))
-        self.norm1 = RMSNorm(int(cfg["dim"]), float(cfg["eps"]), weight_offset=norm_off)
+        eps = float(cfg["eps"])
+        dim = int(cfg["dim"])
+        self.norm1 = RMSNorm(dim, eps, weight_offset=norm_off)
         if layer_type in ("bolt3", "vsa"):
             self.attn = Bolt3Attn(
                 cfg,
@@ -31,13 +49,21 @@ class Bolt3Block(nn.Module):
         elif layer_type in ("linear_attention", "gated_deltanet"):
             self.attn = GatedDeltaNet(cfg, layer_idx=layer_idx)
         else:
-            self.attn = SoftmaxAttn(cfg)
-        self.norm2 = RMSNorm(int(cfg["dim"]), float(cfg["eps"]), weight_offset=norm_off)
+            self.attn = SoftmaxAttn(cfg, layer_idx=layer_idx)
+        self.post_attn_norm = RMSNorm(dim, eps, weight_offset=norm_off) if cfg.get("post_norms", False) else None
+        self.norm2 = RMSNorm(dim, eps, weight_offset=norm_off)
         self.mlp = SwiGLUMLP(cfg)
+        self.post_mlp_norm = RMSNorm(dim, eps, weight_offset=norm_off) if cfg.get("post_norms", False) else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        return x + self.mlp(self.norm2(x))
+        a = self.attn(self.norm1(x))
+        if self.post_attn_norm is not None:
+            a = self.post_attn_norm(a)
+        x = x + a
+        m = self.mlp(self.norm2(x))
+        if self.post_mlp_norm is not None:
+            m = self.post_mlp_norm(m)
+        return x + m
 
 
 class Bolt3LM(nn.Module):
@@ -86,7 +112,12 @@ class Bolt3LM(nn.Module):
             layer_types=layer_types,
             **extra_cfg,
         )
-        self.embed_tokens = nn.Embedding(self.config["vocab_size"], self.config["dim"])
+        embed_scale = float(self.config.get("embed_scale", 1.0))
+        self.embed_tokens = (
+            ScaledEmbedding(self.config["vocab_size"], self.config["dim"], embed_scale=embed_scale)
+            if embed_scale != 1.0
+            else nn.Embedding(self.config["vocab_size"], self.config["dim"])
+        )
         self.blocks = nn.ModuleList([Bolt3Block(self.config, lt, layer_idx=li) for li, lt in enumerate(layer_types)])
         self.norm = RMSNorm(
             self.config["dim"],

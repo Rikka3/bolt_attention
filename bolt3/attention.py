@@ -4,12 +4,13 @@ and Gershgorin Eviction-to-Delta Residual Associative Memory (M_res).
 from __future__ import annotations
 
 import itertools
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .nn import GatedDeltaNet, RMSNorm, RoPE, apply_rope_cos_sin, apply_rope_pos, repeat_kv
+from .nn import GatedDeltaNet, RMSNorm, RoPE, apply_rope_cos_sin, apply_rope_pos, layer_rope_params, repeat_kv
 
 _RUNNER_UID = itertools.count(1)
 
@@ -54,6 +55,8 @@ class Bolt3Attn(nn.Module):
         HD = int(cfg.get("head_dim") or (D // H))
         qkv_bias = bool(cfg.get("qkv_bias", False))
         self.H, self.HKV, self.HD, self.G = H, HKV, HD, H // HKV
+        q_scalar = cfg.get("query_pre_attn_scalar")
+        self.attn_scale = (float(q_scalar) ** -0.5) if q_scalar is not None else (HD ** -0.5)
         self.S = int(S if S is not None else cfg.get("bolt3_S", 128))
         self.C = int(C if C is not None else cfg.get("bolt3_C", 128))
         self.n_sinks = int(cfg.get("bolt3_n_sinks", 4))
@@ -78,10 +81,11 @@ class Bolt3Attn(nn.Module):
             self.k_norm = RMSNorm(HD, float(cfg["eps"]), weight_offset=norm_off)
         else:
             self.q_norm, self.k_norm = None, None
+        r_theta, r_scaling = layer_rope_params(cfg, self.layer_idx)
         self.rope = RoPE(
             HD,
-            float(cfg["rope_theta"]),
-            cfg.get("rope_scaling"),
+            r_theta,
+            r_scaling,
             float(cfg.get("partial_rotary_factor", 1.0)),
         )
 
@@ -119,6 +123,50 @@ class Bolt3Attn(nn.Module):
         return q, k, v
 
     def _consolidate_functional(
+        self,
+        ak,
+        av,
+        mass,
+        util,
+        pm,
+        act,
+        m_res,
+        k_raw,
+        k_rope,
+        v_old,
+        pos_old,
+        beta_old,
+        inv_freq,
+        diag_eye,
+        gam,
+        n_filled: int = 0,
+        tok_valid: torch.Tensor | None = None,
+    ):
+        # Run attractor & M_res consolidation with BF16 autocast disabled so explicit .float()
+        # GEMMs match across forward(), prefill(), eager step(), and un-autocast CUDA-Graph step().
+        ctx = torch.autocast("cuda", enabled=False) if k_raw.is_cuda else nullcontext()
+        with ctx:
+            return self._consolidate_functional_impl(
+                ak,
+                av,
+                mass,
+                util,
+                pm,
+                act,
+                m_res,
+                k_raw,
+                k_rope,
+                v_old,
+                pos_old,
+                beta_old,
+                inv_freq,
+                diag_eye,
+                gam,
+                n_filled=n_filled,
+                tok_valid=tok_valid,
+            )
+
+    def _consolidate_functional_impl(
         self,
         ak,
         av,
@@ -512,7 +560,7 @@ class Bolt3Attn(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Exact attention over `[sink, ak, loc]` plus optional cold blocks (all or interval top-k)."""
         b, hkv, g_sz, t_q, hd = qg.shape
-        scale = hd ** -0.5
+        scale = self.attn_scale
         if cold_k is None or cold_k.shape[2] == 0:
             scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
             v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
@@ -586,7 +634,7 @@ class Bolt3Attn(nn.Module):
         gam = self.gamma_delta()
         inv_freq = self.rope.inv_freq.to(x.device)
         diag_eye = torch.eye(self.S, device=x.device, dtype=torch.bool).unsqueeze(0)
-        scale = self.HD ** -0.5
+        scale = self.attn_scale
 
         sink_k = sink_v = ak = av = mass = util = pm = act = m_res = None
         prev_kr = prev_kp = prev_v = prev_pos = prev_b = None
@@ -729,6 +777,8 @@ def _steady_block_fast(
     cur_b: torch.Tensor,
     m_res: torch.Tensor,
     res_scale: torch.Tensor,
+    post_attn_norm=None,
+    post_mlp_norm=None,
 ) -> torch.Tensor:
     """Zero-cat single-token decode step across unified `[sink | ak_eff | half0 | half1 | cold]` buffers."""
     b = x.shape[0]
@@ -750,9 +800,9 @@ def _steady_block_fast(
     qg = q_p.view(b, ly.HKV, ly.G, 1, ly.HD)
     n_tot = buf_k.shape[2]
     if x.is_cuda and n_tot > 512:
-        scores = torch.matmul(qg, buf_k.unsqueeze(2).transpose(-1, -2)).float() * (ly.HD ** -0.5)
+        scores = torch.matmul(qg, buf_k.unsqueeze(2).transpose(-1, -2)).float() * ly.attn_scale
     else:
-        scores = torch.matmul(qg.float(), buf_k.float().unsqueeze(2).transpose(-1, -2)) * (ly.HD ** -0.5)
+        scores = torch.matmul(qg.float(), buf_k.float().unsqueeze(2).transpose(-1, -2)) * ly.attn_scale
     scores = scores + mask_buf.view(b, ly.HKV, 1, 1, n_tot)
     probs = F.softmax(scores, dim=-1)
     util_acc.add_(probs[..., ly.n_sinks : ly.n_sinks + ly.S].mean(dim=2).reshape(b * ly.HKV, ly.S))
@@ -766,8 +816,14 @@ def _steady_block_fast(
     out = y.transpose(1, 2).reshape(b, 1, ly.H * ly.HD)
     if gate is not None:
         out = out * torch.sigmoid(gate)
-    x = x + ly.o_proj(out)
-    return x + mlp(norm2(x))
+    attn_delta = ly.o_proj(out)
+    if post_attn_norm is not None:
+        attn_delta = post_attn_norm(attn_delta)
+    x = x + attn_delta
+    mlp_delta = mlp(norm2(x))
+    if post_mlp_norm is not None:
+        mlp_delta = post_mlp_norm(mlp_delta)
+    return x + mlp_delta
 
 
 class _Bolt3GraphRunner:
@@ -839,30 +895,45 @@ class _Bolt3GraphRunner:
         self.g_zero_mask = torch.zeros(batch_size, hkv_z, 1, 1, device=device, dtype=torch.float32)
         self.g_out_h = torch.zeros(batch_size, 1, int(model.config["dim"]), device=device, dtype=dtype)
         self.slot_idxs = [torch.tensor([i], device=device, dtype=torch.long) for i in range(max(self.W1, self.C))]
-        self.inv_freq = ly0.rope.inv_freq.to(device) if ly0 is not None else None
+        self.rope_inv_freqs: list[torch.Tensor] = []
+        self.layer_rope_gid: list[int | None] = []
+        rope_sig_to_gid: dict[tuple, int] = {}
+        for blk in model.blocks:
+            ly = blk.attn
+            if isinstance(ly, Bolt3Attn):
+                sig = (int(ly.rope.rotary_dim), tuple(round(float(v), 12) for v in ly.rope.inv_freq.detach().cpu().tolist()))
+                gid = rope_sig_to_gid.get(sig)
+                if gid is None:
+                    gid = len(self.rope_inv_freqs)
+                    rope_sig_to_gid[sig] = gid
+                    self.rope_inv_freqs.append(ly.rope.inv_freq.to(device))
+                self.layer_rope_gid.append(gid)
+            else:
+                self.layer_rope_gid.append(None)
         use_bf16_auto = dtype == torch.bfloat16
 
         def _forward_steady():
             with torch.autocast("cuda", torch.bfloat16, enabled=use_bf16_auto):
                 x = self.model.embed_tokens(self.g_tok)
-                if self.inv_freq is not None:
-                    freqs = self.g_pos.unsqueeze(-1) * self.inv_freq.view(1, 1, 1, -1)
+                rope_cs_list = []
+                for inv_f in self.rope_inv_freqs:
+                    freqs = self.g_pos.unsqueeze(-1) * inv_f.view(1, 1, 1, -1)
                     emb = torch.cat((freqs, freqs), dim=-1)
-                    cos = emb.cos().to(x.dtype)
-                    sin = emb.sin().to(x.dtype)
-                else:
-                    cos = sin = None
+                    rope_cs_list.append((emb.cos().to(x.dtype), emb.sin().to(x.dtype)))
                 for li, blk in enumerate(self.model.blocks):
                     ly = blk.attn
+                    p_an = getattr(blk, "post_attn_norm", None)
+                    p_mn = getattr(blk, "post_mlp_norm", None)
                     if isinstance(ly, Bolt3Attn):
+                        cos_l, sin_l = rope_cs_list[self.layer_rope_gid[li]]
                         x = _steady_block_fast(
                             ly,
                             blk.norm1,
                             blk.norm2,
                             blk.mlp,
                             x,
-                            cos,
-                            sin,
+                            cos_l,
+                            sin_l,
                             self.g_pos,
                             self.g_slot_buf,
                             self.g_slot_cur,
@@ -876,10 +947,18 @@ class _Bolt3GraphRunner:
                             self.cur_b[li],
                             self.states[li],
                             self.res_scales[li],
+                            post_attn_norm=p_an,
+                            post_mlp_norm=p_mn,
                         )
                     else:
-                        x = x + ly.step_graph(blk.norm1(x), self.conv_states[li], self.states[li])
-                        x = x + blk.mlp(blk.norm2(x))
+                        a_d = ly.step_graph(blk.norm1(x), self.conv_states[li], self.states[li])
+                        if p_an is not None:
+                            a_d = p_an(a_d)
+                        x = x + a_d
+                        m_d = blk.mlp(blk.norm2(x))
+                        if p_mn is not None:
+                            m_d = p_mn(m_d)
+                        x = x + m_d
                 return self.model.norm(x)
 
         s = torch.cuda.Stream(device=device)
@@ -907,6 +986,8 @@ class _Bolt3GraphRunner:
             self.cur_b,
             self.res_scales,
             self.slot_idxs,
+            self.rope_inv_freqs,
+            self.layer_rope_gid,
         ):
             lst.clear()
         self.model = None
@@ -1606,6 +1687,8 @@ class Bolt3Decoder:
                     sc["cur_b"],
                     states[li],
                     res_scale,
+                    post_attn_norm=getattr(blk, "post_attn_norm", None),
+                    post_mlp_norm=getattr(blk, "post_mlp_norm", None),
                 )
                 new_len = len_before + 1
                 sc["cur_len"] = new_len
@@ -1641,7 +1724,7 @@ class Bolt3Decoder:
             if valid_mask is not None:
                 beta_n = beta_n * valid_mask.unsqueeze(1).to(beta_n.dtype)
             eta_n = torch.tanh(ly.eta_proj(h)).transpose(1, 2).unsqueeze(-1)
-            scale = ly.HD ** -0.5
+            scale = ly.attn_scale
 
             if sc["cur_kr"] is None:
                 sc["cur_kr"] = torch.empty(b, ly.HKV, ly.C, ly.HD, device=device, dtype=k_r.dtype)
@@ -1745,54 +1828,76 @@ class Bolt3Decoder:
             out_blk = y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD)
             if gate is not None:
                 out_blk = out_blk * torch.sigmoid(gate)
-            x = x + ly.o_proj(out_blk)
+            attn_d = ly.o_proj(out_blk)
+            p_an = getattr(blk, "post_attn_norm", None)
+            if p_an is not None:
+                attn_d = p_an(attn_d)
+            x = x + attn_d
 
             if new_len >= ly.C:
                 self._consolidate_layer(li, ly, sc, states, b, device, inv_freq, gam, unified=False)
         elif isinstance(ly, GatedDeltaNet):
             sc = kv_caches[li]
             h = blk.norm1(x)
-            x = x + ly.step_with_state(h, sc["conv_state"], states[li], valid_mask=valid_mask)
+            attn_d = ly.step_with_state(h, sc["conv_state"], states[li], valid_mask=valid_mask)
+            p_an = getattr(blk, "post_attn_norm", None)
+            if p_an is not None:
+                attn_d = p_an(attn_d)
+            x = x + attn_d
         else:
             h = blk.norm1(x)
             q, k, v, gate = ly.head_qkv_gate(h)
             q, k = ly.rope(q, pos_start=pos_start), ly.rope(k, pos_start=pos_start)
             n_prev = kv_caches[li].n
             pk, pv = kv_caches[li].append(k, v)
-            if t_s > 1:
-                qi = torch.arange(t_s, device=device)[:, None]
+            sw = getattr(ly, "sliding_window", None)
+            if t_s > 1 or (sw is not None and (n_prev + t_s) > sw):
+                qi = torch.arange(t_s, device=device)[:, None] + n_prev
                 kj = torch.arange(n_prev + t_s, device=device)[None, :]
-                cmask = (kj <= (n_prev + qi)).view(1, 1, t_s, n_prev + t_s)
+                cmask = kj <= qi
+                if sw is not None:
+                    cmask = cmask & (kj > (qi - sw))
+                cmask = cmask.view(1, 1, t_s, n_prev + t_s)
                 try:
                     y = F.scaled_dot_product_attention(
-                        q, pk.to(q.dtype), pv.to(q.dtype), attn_mask=cmask, enable_gqa=(ly.G > 1)
+                        q, pk.to(q.dtype), pv.to(q.dtype), attn_mask=cmask, scale=ly.attn_scale, enable_gqa=(ly.G > 1)
                     )
                 except TypeError:
                     y = F.scaled_dot_product_attention(
-                        q, repeat_kv(pk.to(q.dtype), ly.G), repeat_kv(pv.to(q.dtype), ly.G), attn_mask=cmask
+                        q, repeat_kv(pk.to(q.dtype), ly.G), repeat_kv(pv.to(q.dtype), ly.G), attn_mask=cmask, scale=ly.attn_scale
                     )
             else:
                 try:
-                    y = F.scaled_dot_product_attention(q, pk.to(q.dtype), pv.to(q.dtype), enable_gqa=(ly.G > 1))
+                    y = F.scaled_dot_product_attention(
+                        q, pk.to(q.dtype), pv.to(q.dtype), scale=ly.attn_scale, enable_gqa=(ly.G > 1)
+                    )
                 except TypeError:
                     y = F.scaled_dot_product_attention(
-                        q, repeat_kv(pk.to(q.dtype), ly.G), repeat_kv(pv.to(q.dtype), ly.G)
+                        q, repeat_kv(pk.to(q.dtype), ly.G), repeat_kv(pv.to(q.dtype), ly.G), scale=ly.attn_scale
                     )
             out_blk = y.transpose(1, 2).reshape(b, t_s, ly.H * ly.HD)
             if gate is not None:
                 out_blk = out_blk * torch.sigmoid(gate)
             elif getattr(ly, "g_proj", None) is not None:
                 out_blk = out_blk * torch.sigmoid(ly.g_proj(h))
-            x = x + ly.o_proj(out_blk)
+            attn_d = ly.o_proj(out_blk)
+            p_an = getattr(blk, "post_attn_norm", None)
+            if p_an is not None:
+                attn_d = p_an(attn_d)
+            x = x + attn_d
 
-        return x + blk.mlp(blk.norm2(x))
+        mlp_d = blk.mlp(blk.norm2(x))
+        p_mn = getattr(blk, "post_mlp_norm", None)
+        if p_mn is not None:
+            mlp_d = p_mn(mlp_d)
+        return x + mlp_d
 
     def _can_use_graph(
         self, tokens: torch.Tensor, valid_mask, kv_caches, dtype: torch.dtype, cold_caps: tuple[int, ...]
     ) -> bool:
         if not (tokens.is_cuda and tokens.shape[1] == 1 and valid_mask is None and self.use_cuda_graph):
             return False
-        if not (self._all_fast_step and self._shared_rope and len(kv_caches) == len(self.model.blocks)):
+        if not (self._all_fast_step and len(kv_caches) == len(self.model.blocks)):
             return False
         if any(
             isinstance(blk.attn, Bolt3Attn) and blk.attn.is_cold_armed and blk.attn.max_cold_blocks > 0 and blk.attn.cold_topk > 0
@@ -1982,9 +2087,9 @@ class Bolt3Decoder:
                     for li in b3:
                         kv_caches[li]["cur_len"] = new_len
                     if ly0 is not None and new_len >= ly0.C:
-                        inv_freq = ly0.rope.inv_freq.to(tokens.device)
                         for li in b3:
                             ly = m.blocks[li].attn
+                            inv_freq = ly.rope.inv_freq.to(tokens.device)
                             gam, _ = self._get_gam_scale(ly, tokens.device)
                             self._consolidate_layer(li, ly, kv_caches[li], states, b, tokens.device, inv_freq, gam, unified=True)
                     return out_h, states, kv_caches
