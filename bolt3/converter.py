@@ -257,7 +257,7 @@ def _build_reasoning_and_eval_caches(
         buf = array("i")
         for b_i in range(0, len(docs), 128):
             for ids in tok(docs[b_i : b_i + 128], add_special_tokens=False)["input_ids"]:
-                if bos_id is not None:
+                if bos_id is not None and (not ids or int(ids[0]) != int(bos_id)):
                     buf.append(int(bos_id))
                 buf.extend(ids)
                 buf.append(int(eos_id))
