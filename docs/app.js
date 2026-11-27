@@ -46,40 +46,40 @@
     { l: 35, kind: "bolt3", gam: "0.9693-0.9699", kap: "1.0021", bw: "0.5154", ew: "0.8225", rms: "0.0518" }
   ];
 
-  // Exact verified parameter scan from bolt3_b_qwen3_5_4b_latest.pth (step=501)
+  // Exact verified parameter scan from bolt3.1-qwen3.5-4b.pth (step=501)
   const LAYER_SCAN_QWEN35 = [
     { l: 0, kind: "gdn", gam: "decay_a 0.093..0.381", kap: "dt +1.293", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 1, kind: "gdn", gam: "decay_a 7.03..49.71", kap: "dt -3.237", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 2, kind: "gdn", gam: "decay_a 13.01..74.63", kap: "dt -3.829", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 3, kind: "bolt3", gam: "0.9559-0.9669", kap: "1.1439", bw: "2.6943", ew: "3.7464", rms: "0.1160" },
+    { l: 3, kind: "bolt3", gam: "0.9953-0.9957", kap: "0.8641", bw: "2.1413", ew: "2.2604", rms: "0.0678" },
     { l: 4, kind: "gdn", gam: "decay_a 3.53..18.29", kap: "dt -3.249", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 5, kind: "gdn", gam: "decay_a 2.27..20.40", kap: "dt -2.809", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 6, kind: "gdn", gam: "decay_a 3.53..54.60", kap: "dt -3.721", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 7, kind: "bolt3", gam: "0.9465-0.9622", kap: "1.2769", bw: "2.9025", ew: "3.3597", rms: "0.1459" },
+    { l: 7, kind: "bolt3", gam: "0.9957-0.9961", kap: "0.8481", bw: "2.3693", ew: "2.4289", rms: "0.1052" },
     { l: 8, kind: "gdn", gam: "decay_a 1.74..7.74", kap: "dt -3.396", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 9, kind: "gdn", gam: "decay_a 1.64..27.03", kap: "dt -3.808", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 10, kind: "gdn", gam: "decay_a 2.39..10.92", kap: "dt -4.161", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 11, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 11, kind: "cold", gam: "0.9959-0.9963", kap: "0.8890", bw: "2.3950", ew: "2.7415", rms: "0.1141" },
     { l: 12, kind: "gdn", gam: "decay_a 3.28..74.63", kap: "dt -3.890", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 13, kind: "gdn", gam: "decay_a 2.37..13.59", kap: "dt -3.540", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 14, kind: "gdn", gam: "decay_a 3.25..33.12", kap: "dt -3.742", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 15, kind: "bolt3", gam: "0.9440-0.9532", kap: "1.1171", bw: "2.6766", ew: "3.4359", rms: "0.1319" },
+    { l: 15, kind: "bolt3", gam: "0.9960-0.9962", kap: "0.8907", bw: "2.4065", ew: "2.8095", rms: "0.1279" },
     { l: 16, kind: "gdn", gam: "decay_a 0.75..5.04", kap: "dt -3.668", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 17, kind: "gdn", gam: "decay_a 2.62..22.06", kap: "dt -3.523", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 18, kind: "gdn", gam: "decay_a 0.92..10.92", kap: "dt -3.328", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 19, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 19, kind: "cold", gam: "0.9959-0.9962", kap: "0.8747", bw: "2.4138", ew: "2.5697", rms: "0.1321" },
     { l: 20, kind: "gdn", gam: "decay_a 0.47..4.73", kap: "dt -2.879", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 21, kind: "gdn", gam: "decay_a 0.33..1.79", kap: "dt -1.917", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 22, kind: "gdn", gam: "decay_a 0.29..3.20", kap: "dt -0.916", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 23, kind: "bolt3", gam: "0.9643-0.9708", kap: "0.9287", bw: "2.3640", ew: "3.5998", rms: "0.0915" },
+    { l: 23, kind: "bolt3", gam: "0.9959-0.9963", kap: "0.7808", bw: "2.2730", ew: "2.5461", rms: "0.1088" },
     { l: 24, kind: "gdn", gam: "decay_a 0.20..0.47", kap: "dt -1.439", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 25, kind: "gdn", gam: "decay_a 0.29..2.31", kap: "dt -0.862", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 26, kind: "gdn", gam: "decay_a 0.22..0.62", kap: "dt +0.226", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 27, kind: "cold", gam: "0.9697-0.9697", kap: "1.0000", bw: "0.0000", ew: "0.0000", rms: "0.0500" },
+    { l: 27, kind: "cold", gam: "0.9958-0.9961", kap: "0.7268", bw: "2.2922", ew: "2.5207", rms: "0.1190" },
     { l: 28, kind: "gdn", gam: "decay_a 0.33..3.01", kap: "dt -0.069", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 29, kind: "gdn", gam: "decay_a 0.23..0.60", kap: "dt -0.173", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
     { l: 30, kind: "gdn", gam: "decay_a 0.26..1.02", kap: "dt -0.976", bw: "24 GDN", ew: "native", rms: "2.05 MB" },
-    { l: 31, kind: "bolt3", gam: "0.9540-0.9636", kap: "0.9936", bw: "2.7089", ew: "3.5899", rms: "0.1559" }
+    { l: 31, kind: "bolt3", gam: "0.9956-0.9958", kap: "0.8439", bw: "2.3094", ew: "2.2425", rms: "0.1012" }
   ];
 
   const MODELS = {
@@ -88,37 +88,37 @@
       hfRepo: "rikkathree/bolt-qwen3.5-4b",
       hfUrl: "https://huggingface.co/rikkathree/bolt-qwen3.5-4b",
       donor: "Qwen/Qwen3.5-4B",
-      ckpt: "bolt3_b_qwen3_5_4b_latest.pth",
+      ckpt: "bolt3.1-qwen3.5-4b.pth",
       stats: [
-        ["4 / 4", "4-Needle NIAH (4k–32k)", "100% recall matching Donor at 4k, 16k & 32k"],
-        ["87.50%", "IFEval / MMLU 70.0%", "Donor: IFEval 87.5% • MMLU 67.5% • HumanEval 79.9%"],
-        ["-59.1%", "State RAM @ 64k (Flat >32k)", "858 MB vs 2,097 MB Donor (1.26x tok/s)"],
-        ["0.999×", "Val PPL vs Donor (KL 0.0257)", "Top1 95.06% + 4/4 Disk .vsa Recall (0.0 erase)"]
+        ["75.0% / 62.5%", "4-Needle NIAH (64k / 128k)", "18/24 @64k • 15/24 @128k (4/4 single-pass @4k-32k)"],
+        ["88.0% / 80.5%", "IFEval / HumanEval Parity", "Donor: IFEval 87.5% • HumanEval 80.5% • All 7 p >= 0.125"],
+        ["-58.4%", "State RAM @ 64k (Flat >32k)", "873 MB vs 2,097 MB Donor (1.27x tok/s)"],
+        ["1.005×", "Val PPL vs Donor (KL 0.0080)", "Top1 97.75% + TruthfulQA mc1 71.73% / mc2 34.15%"]
       ],
-      layersTitle: "Inspect All 32 Layers of <code>bolt3_b_qwen3_5_4b_latest.pth</code>",
-      layersDesc: "Click any layer tile from the verified CPU parameter scan (step = 501). Green tiles are native preserved <code>GatedDeltaNet</code> layers (24/32), Flame tiles are compressed pure <code>O(1)</code> <code>Bolt3Attn</code> layers (5/32), and Gold tiles are sparse Option-B Cold-Armed <code>Bolt3Attn</code> layers (<code>[11, 19, 27]</code>).",
+      layersTitle: "Inspect All 32 Layers of <code>bolt3.1-qwen3.5-4b.pth</code>",
+      layersDesc: "Click any layer tile from the verified CPU parameter scan (step = 501, <code>L_mem</code> supervised). Green tiles are native preserved <code>GatedDeltaNet</code> layers (24/32), Flame tiles are compressed pure <code>O(1)</code> <code>Bolt3Attn</code> layers (5/32), and Gold tiles are Option-B Cold-Armed <code>Bolt3Attn</code> layers (<code>[11, 19, 27]</code>) with active <code>beta</code>/<code>eta</code> gates.",
       defaultLayer: 11,
       layers: LAYER_SCAN_QWEN35,
       benchTitle: "Verified Against <code>Qwen/Qwen3.5-4B</code> on RTX PRO 6000",
-      benchSub: "Mistral Flame = Bolt-3 Option-B • Blue = Qwen/Qwen3.5-4B Donor (HF eager GDN fallback)",
-      niahHtml: "<strong>Multi-Needle NIAH &amp; Perplexity (<code>Qwen/Qwen3.5-4B</code> Hybrid Option-B):</strong> With sparse Cold-Armed routing on just 3 of Qwen3.5's 8 attention layers (<code>[11, 19, 27]</code>) and 24 preserved <code>GatedDeltaNet</code> layers, Bolt-3.5 hits <strong>4/4 (100%) on simultaneous 4-Needle NIAH at <code>4k, 16k, and 32k</code></strong>, <strong>100% 1-Needle Passkey</strong> (<code>5.4x</code> lower batch peak VRAM @32k), <strong>1.014x FineWeb reference PPL</strong>, and <strong>100% (4/4) Disk <code>.vsa</code> Recall</strong>. (Note: On GSM8K <code>N=200</code> at 2048-token cap, Donor truncated <code>104/200</code> chains vs Bolt-3's <code>67/200</code>.)",
+      benchSub: "Mistral Flame = Bolt-3.1 Option-B • Blue = Qwen/Qwen3.5-4B Donor (HF eager GDN fallback; all p >= 0.125)",
+      niahHtml: "<strong>Multi-Needle NIAH, TruthfulQA &amp; Matched Controls (<code>Qwen/Qwen3.5-4B</code> Bolt-3.1):</strong> Paired single-pass 4-Needle NIAH hits <strong>4/4 (100%) at <code>4k, 16k, 32k</code></strong> and <code>2/4</code> at <code>64k</code>; multi-seed <code>64k_32k</code> reaches <strong>75.0% (18/24)</strong> and <code>128k_32k</code> reaches <strong>62.5% (15/24)</strong> (<code>d=0.10</code> evicted needles up from <code>0/8</code> to <code>2/8</code>). Beats equal-budget <code>SWA_W640+Cold</code> across <code>16k/64k</code> WikiText KL (<code>0.0660/0.1272</code> vs <code>0.0798/0.1464</code>) while still trailing full-byte <code>SWA_W898+Cold</code> (<code>0.0624/0.1137</code>). UK AISI TruthfulQA matches Donor at <strong>71.73% mc1</strong> &amp; <strong>34.15% mc2</strong> (<code>p >= 0.125</code>, <code>0</code> format errors), plus <strong>100% (4/4) Disk <code>.vsa</code> Recall</strong> (<code>0.0</code> erase residual).",
       maxY: 2250,
       maxLabel: "2.1G",
       tasks: [
-        { name: "MMLU", bolt: 70.00, donor: 67.50, p: "0.442" },
-        { name: "ARC-Chall.", bolt: 53.50, donor: 51.50, p: "0.219" },
-        { name: "HellaSwag", bolt: 60.50, donor: 62.00, p: "0.453" },
-        { name: "GSM8K", bolt: 66.00, donor: 47.50, p: "<0.001" },
-        { name: "HumanEval", bolt: 78.66, donor: 79.88, p: "0.774" },
-        { name: "MBPP", bolt: 54.00, donor: 56.00, p: "0.344" },
-        { name: "IFEval", bolt: 87.50, donor: 87.50, p: "1.000" }
+        { name: "MMLU", bolt: 67.00, donor: 67.50, p: "1.000" },
+        { name: "ARC-Chall.", bolt: 51.50, donor: 51.50, p: "1.000" },
+        { name: "HellaSwag", bolt: 61.50, donor: 62.00, p: "1.000" },
+        { name: "GSM8K", bolt: 46.50, donor: 49.50, p: "0.461" },
+        { name: "HumanEval", bolt: 80.49, donor: 80.49, p: "1.000" },
+        { name: "MBPP", bolt: 55.00, donor: 57.00, p: "0.125" },
+        { name: "IFEval", bolt: 88.00, donor: 87.50, p: "1.000" }
       ],
       scaling: [
-        { ctx: 2048, label: "2k", donorMb: 113.12, boltMb: 131.93, saved: -16.6, donorTps: 40.1, boltTps: 75.1, spd: 1.87 },
-        { ctx: 8192, label: "8k", donorMb: 305.12, boltMb: 276.44, saved: 9.4, donorTps: 39.8, boltTps: 68.9, spd: 1.73 },
-        { ctx: 16384, label: "16k", donorMb: 561.12, boltMb: 469.12, saved: 16.4, donorTps: 39.6, boltTps: 61.5, spd: 1.55 },
-        { ctx: 32768, label: "32k", donorMb: 1073.12, boltMb: 854.48, saved: 20.4, donorTps: 39.9, boltTps: 50.3, spd: 1.26 },
-        { ctx: 65536, label: "64k", donorMb: 2097.12, boltMb: 858.26, saved: 59.1, donorTps: 39.8, boltTps: 50.2, spd: 1.26 }
+        { ctx: 2048, label: "2k", donorMb: 113.12, boltMb: 141.21, saved: -24.8, donorTps: 38.2, boltTps: 73.2, spd: 1.92 },
+        { ctx: 8192, label: "8k", donorMb: 305.12, boltMb: 286.28, saved: 6.2, donorTps: 39.4, boltTps: 67.3, spd: 1.71 },
+        { ctx: 16384, label: "16k", donorMb: 561.12, boltMb: 479.71, saved: 14.5, donorTps: 39.0, boltTps: 60.2, spd: 1.54 },
+        { ctx: 32768, label: "32k", donorMb: 1073.12, boltMb: 866.57, saved: 19.2, donorTps: 37.5, boltTps: 49.4, spd: 1.32 },
+        { ctx: 65536, label: "64k", donorMb: 2097.12, boltMb: 873.38, saved: 58.4, donorTps: 38.9, boltTps: 49.3, spd: 1.27 }
       ]
     },
     qwen3: {
@@ -288,12 +288,12 @@
   let useOptionB = true;
 
   const STAGE_META = [
-    { name: "01 / O(N) Softmax Bottleneck", geom: "L=36 Softmax • HKV=8 • HD=128", memOptB: "Donor @64k: 9,216 MB", memFull: "Donor @64k: 9,216 MB" },
-    { name: "02 / Sink + Local Chunk Window", geom: "n_sinks=4 • 2C=256 • CUDA Graph", memOptB: "Unified in-place buf_k", memFull: "Unified in-place buf_k" },
-    { name: "03 / Diversity Attractors", geom: "S=128 slots • cos_k>=0.94, cos_v>=0.88", memOptB: "Per layer fixed: 0.50 MB", memFull: "Per layer fixed: 0.50 MB" },
-    { name: "04 / Gershgorin Delta M_res", geom: "Matrix [8, 128, 128] float32", memOptB: "Per layer fixed: 0.50 MB", memFull: "Per layer fixed: 0.50 MB" },
-    { name: "05 / Option-B Cold Layers", geom: "4 Cold [14,19,24,29] • max=256 blks", memOptB: "1,186 MB @64k (-87.1%)", memFull: "~150 MB flat all contexts" },
-    { name: "06 / Disk .vsa + Exact Forget", geom: "Cosine router (37.4 ms) • Linear delta", memOptB: "4/4 recall • 0.0 erase err", memFull: "4/4 recall • 0.0 erase err" }
+    { name: "01 / O(N) Softmax Bottleneck", geom: "Full Softmax KV • Linear RAM Growth", memOptB: "Donor @64k: 2.1G–9.2G", memFull: "Donor @64k: 2.1G–9.2G" },
+    { name: "02 / Sink + 4C Unified Ring", geom: "n_sinks=4 • 4C=512 Ring • CUDA Graph", memOptB: "Unified in-place buf_k", memFull: "Unified in-place buf_k" },
+    { name: "03 / Tri-Partition Attractors", geom: "S=128 (48 HH + 48 Land + 32 Proto)", memOptB: "-31–36% KL vs TrueNoAtt", memFull: "-31–36% KL vs TrueNoAtt" },
+    { name: "04 / Gershgorin M_res + L_mem", geom: "Matrix [HKV, HD, HD] float32", memOptB: "Trained via L_mem loss", memFull: "Trained via L_mem loss" },
+    { name: "05 / Option-B Cold Layers", geom: "Sparse Cold [11,19,27] • max=256", memOptB: "873 MB @64k (-58.4%)", memFull: "~150 MB flat all contexts" },
+    { name: "06 / Disk .vsa + Exact Forget", geom: "Cosine router (33.6 ms) • Linear delta", memOptB: "4/4 recall • 0.0 erase err", memFull: "4/4 recall • 0.0 erase err" }
   ];
 
   function setStep(idx) {
@@ -432,18 +432,17 @@
       const totW = w - pad * 2;
       const segs = [
         { lbl: "SINK", sub: "4 tok", frac: 0.09, col: FLAME[0] },
-        { lbl: "AK_EFF", sub: "S=128", frac: 0.26, col: FLAME[1] },
-        { lbl: "HALF_0", sub: "prev C=128", frac: 0.23, col: FLAME[2] },
-        { lbl: "HALF_1", sub: "cur (live)", frac: 0.23, col: FLAME[3] },
-        { lbl: useOptionB ? "COLD" : "NO COLD", sub: useOptionB ? "4 layers" : "0 slots", frac: 0.19, col: useOptionB ? FLAME[4] : "#2b2b36" }
+        { lbl: "AK_EFF", sub: "S=128 tri-part", frac: 0.27, col: FLAME[1] },
+        { lbl: "LOC_RING", sub: "4C=512 exact", frac: 0.43, col: FLAME[2] },
+        { lbl: useOptionB ? "COLD" : "NO COLD", sub: useOptionB ? "sparse+hit" : "0 slots", frac: 0.21, col: useOptionB ? FLAME[4] : "#2b2b36" }
       ];
       let cx = pad;
       const curSlot = Math.floor(((phase * 4) % 16));
       segs.forEach((sg, idx) => {
         const sw = Math.floor(totW * sg.frac) - 4;
         drawBox(ctx, cx, topY, sw, boxH, sg.col, "rgba(255,255,255,0.03)", sg.lbl, sg.sub);
-        // Animated token cursor inside HALF_1
-        if (idx === 3) {
+        // Animated token cursor inside LOC_RING
+        if (idx === 2) {
           for (let k = 0; k < 16; k++) {
             const kw = (sw - 16) / 16;
             ctx.fillStyle = k <= curSlot ? FLAME[3] : "rgba(255,175,0,0.14)";
@@ -786,6 +785,30 @@
   if (ctxSlider) {
     ctxSlider.addEventListener("input", () => updateScaling(Number(ctxSlider.value)));
   }
+
+  // --- Changelog Modal ---
+  const clBtn = document.getElementById("changelog-btn");
+  const clModal = document.getElementById("changelog-modal");
+  const clClose = document.getElementById("cl-close");
+  const clBackdrop = document.getElementById("cl-backdrop");
+  const openChangelog = () => {
+    if (!clModal) return;
+    clModal.hidden = false;
+    clClose?.focus();
+  };
+  const closeChangelog = () => {
+    if (!clModal) return;
+    clModal.hidden = true;
+    clBtn?.focus();
+  };
+  clBtn?.addEventListener("click", openChangelog);
+  clClose?.addEventListener("click", closeChangelog);
+  clBackdrop?.addEventListener("click", closeChangelog);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && clModal && !clModal.hidden) {
+      closeChangelog();
+    }
+  });
 
   // --- Animation Loop ---
   function loop(t) {
