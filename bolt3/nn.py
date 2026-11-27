@@ -229,21 +229,47 @@ class SoftmaxAttn(nn.Module):
         B, T, _ = x.shape
         q, k, v, gate = self.head_qkv_gate(x)
         q, k = self.rope(q), self.rope(k)
-        attn_mask = None
-        is_causal = True
-        if self.sliding_window is not None and T > self.sliding_window:
-            qi = torch.arange(T, device=x.device)[:, None]
-            kj = torch.arange(T, device=x.device)[None, :]
-            attn_mask = (kj <= qi) & (kj > (qi - self.sliding_window))
-            is_causal = False
-        try:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.attn_scale, enable_gqa=(self.G > 1)
-            )
-        except TypeError:
-            y = F.scaled_dot_product_attention(
-                q, repeat_kv(k, self.G), repeat_kv(v, self.G), attn_mask=attn_mask, is_causal=is_causal, scale=self.attn_scale
-            )
+        if getattr(self, "_capture_evict_target", False):
+            C = int(getattr(self, "_evict_C", 128))
+            loc_chunks = int(getattr(self, "_evict_loc_chunks", 4))
+            n_sinks = int(getattr(self, "_evict_n_sinks", 4))
+            ke = repeat_kv(k, self.G) if self.G > 1 else k
+            ve = repeat_kv(v, self.G) if self.G > 1 else v
+            pos = torch.arange(T, device=x.device)
+            y_parts, w_parts = [], []
+            with torch.no_grad():
+                for qs in range(0, T, 256):
+                    qe = min(T, qs + 256)
+                    q_s = q[:, :, qs:qe]
+                    scores = torch.matmul(q_s.float(), ke[:, :, :qe].transpose(-2, -1).float()) * self.attn_scale
+                    qp = pos[qs:qe].view(1, 1, qe - qs, 1)
+                    kp = pos[:qe].view(1, 1, 1, qe)
+                    causal = kp <= qp
+                    if self.sliding_window is not None and T > self.sliding_window:
+                        causal = causal & (kp > (qp - self.sliding_window))
+                    probs = F.softmax(scores.masked_fill(~causal, float("-inf")), dim=-1)
+                    y_parts.append(torch.matmul(probs.to(ve.dtype), ve[:, :, :qe]))
+                    lo_k = ((qp // C) - (loc_chunks - 1)).clamp_min(0) * C
+                    ev_m = (kp >= n_sinks) & (kp < lo_k)
+                    w_parts.append(probs.masked_fill(~ev_m, 0.0).sum(dim=-1).mean(dim=1))
+            y = torch.cat(y_parts, dim=2)
+            self._evict_aux = (y.transpose(1, 2).reshape(B, T, self.H * self.HD).detach(), torch.cat(w_parts, dim=1).detach())
+        else:
+            attn_mask = None
+            is_causal = True
+            if self.sliding_window is not None and T > self.sliding_window:
+                qi = torch.arange(T, device=x.device)[:, None]
+                kj = torch.arange(T, device=x.device)[None, :]
+                attn_mask = (kj <= qi) & (kj > (qi - self.sliding_window))
+                is_causal = False
+            try:
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.attn_scale, enable_gqa=(self.G > 1)
+                )
+            except TypeError:
+                y = F.scaled_dot_product_attention(
+                    q, repeat_kv(k, self.G), repeat_kv(v, self.G), attn_mask=attn_mask, is_causal=is_causal, scale=self.attn_scale
+                )
         out = y.transpose(1, 2).reshape(B, T, self.H * self.HD)
         if gate is not None:
             out = out * torch.sigmoid(gate)

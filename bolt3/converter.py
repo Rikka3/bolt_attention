@@ -19,6 +19,7 @@ import torch.utils.checkpoint
 from .attention import Bolt3Attn, Bolt3Decoder
 from .inspector import fetch_any_donor, inspect_donor_config, load_all_safetensors, map_hf_to_bolt3
 from .model import FP32_KEYS, Bolt3LM, load_bolt3_checkpoint
+from .nn import SoftmaxAttn
 
 
 def _purge_zombie_vram():
@@ -471,6 +472,15 @@ def _attn_transfer_loss(a_hat: torch.Tensor, a_tgt: torch.Tensor) -> torch.Tenso
     return rel_mse + (1.0 - F.cosine_similarity(a_hat, a_tgt, dim=-1).mean())
 
 
+def _snapshot_cold_blocks(stu) -> dict[int, int]:
+    return {li: int(blk.attn.max_cold_blocks) for li, blk in enumerate(stu.blocks) if isinstance(blk.attn, Bolt3Attn)}
+
+
+def _set_cold_blocks(stu, cap_map: dict[int, int], override: int | None = None):
+    for li, cap in cap_map.items():
+        stu.blocks[li].attn.max_cold_blocks = int(cap) if override is None else min(int(cap), int(override))
+
+
 def _stage1_attention_transfer(
     stu,
     donor,
@@ -489,6 +499,8 @@ def _stage1_attention_transfer(
     bolt3_indices = [li for li in range(L) if isinstance(stu.blocks[li].attn, Bolt3Attn)]
     if not bolt3_indices:
         return
+    saved_cold = _snapshot_cold_blocks(stu)
+    _set_cold_blocks(stu, saved_cold, override=0)
     if on_policy and is_hf_donor:
         print("  [Stage-1] on-policy mode needs a native donor replica; using teacher-forced.", flush=True)
     on_policy_from = steps // 4 if (on_policy and not is_hf_donor) else None
@@ -512,79 +524,83 @@ def _stage1_attention_transfer(
     ar = torch.arange(T)
     t0 = time.perf_counter()
     print(
-        f"  [Stage-1 Attention Transfer] {stage1_tokens/1e6:.1f}M tokens ({steps} steps) across {len(bolt3_indices)} Bolt-3 layers...",
+        f"  [Stage-1 Attention Transfer] {stage1_tokens/1e6:.1f}M tokens ({steps} steps, cold_cap=0 forced eviction) "
+        f"across {len(bolt3_indices)} Bolt-3 layers...",
         flush=True,
     )
 
-    stu.train()
-    for s in range(steps):
-        idx = torch.randint(0, n_win, (bs,), generator=gen)
-        x = train_tokens[idx[:, None] * T + ar[None, :]].long().to(device)
-        opt.zero_grad(set_to_none=True)
+    try:
+        stu.train()
+        for s in range(steps):
+            idx = torch.randint(0, n_win, (bs,), generator=gen)
+            x = train_tokens[idx[:, None] * T + ar[None, :]].long().to(device)
+            opt.zero_grad(set_to_none=True)
 
-        if on_policy_from is not None and s == on_policy_from:
-            print(f"    [Stage-1] step {s+1}: switching to on-policy student stream", flush=True)
-        total_loss = torch.zeros((), device=device, dtype=torch.float32)
+            if on_policy_from is not None and s == on_policy_from:
+                print(f"    [Stage-1] step {s+1}: switching to on-policy student stream", flush=True)
+            total_loss = torch.zeros((), device=device, dtype=torch.float32)
 
-        if on_policy_from is not None and s >= on_policy_from:
-            bolt3_set = set(bolt3_indices)
-            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-                with torch.no_grad():
-                    xs = stu.embed_tokens(x)
-                for li, blk in enumerate(stu.blocks):
+            if on_policy_from is not None and s >= on_policy_from:
+                bolt3_set = set(bolt3_indices)
+                with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
                     with torch.no_grad():
-                        h_n = blk.norm1(xs)
-                        a_tgt = donor.blocks[li].attn(h_n)
-                    p_an = getattr(blk, "post_attn_norm", None)
-                    p_mn = getattr(blk, "post_mlp_norm", None)
-                    if li in bolt3_set:
-                        a_hat = blk.attn(h_n)
-                        loss_li = _attn_transfer_loss(a_hat, a_tgt) / len(bolt3_indices)
+                        xs = stu.embed_tokens(x)
+                    for li, blk in enumerate(stu.blocks):
+                        with torch.no_grad():
+                            h_n = blk.norm1(xs)
+                            a_tgt = donor.blocks[li].attn(h_n)
+                        p_an = getattr(blk, "post_attn_norm", None)
+                        p_mn = getattr(blk, "post_mlp_norm", None)
+                        if li in bolt3_set:
+                            a_hat = blk.attn(h_n)
+                            loss_li = _attn_transfer_loss(a_hat, a_tgt) / len(bolt3_indices)
+                            loss_li.backward()
+                            total_loss = total_loss + loss_li.detach()
+                            a_res = p_an(a_hat.detach()) if p_an is not None else a_hat.detach()
+                            xs = xs + a_res
+                            del a_hat, loss_li
+                        else:
+                            a_res = p_an(a_tgt) if p_an is not None else a_tgt
+                            xs = xs + a_res
+                        with torch.no_grad():
+                            m_out = blk.mlp(blk.norm2(xs))
+                            if p_mn is not None:
+                                m_out = p_mn(m_out)
+                            xs = xs + m_out
+                        del a_tgt
+                del xs
+            else:
+                norm_inputs, attn_targets = {}, {}
+                with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+                    xt = donor.embed_tokens(x)
+                    for li, blk in enumerate(donor.blocks):
+                        h_n = blk.norm1(xt)
+                        a_out = blk.attn(h_n)
+                        if li in bolt3_indices:
+                            norm_inputs[li] = h_n.detach()
+                            attn_targets[li] = a_out.detach()
+                        p_an = getattr(blk, "post_attn_norm", None)
+                        p_mn = getattr(blk, "post_mlp_norm", None)
+                        xt = xt + (p_an(a_out) if p_an is not None else a_out)
+                        m_out = blk.mlp(blk.norm2(xt))
+                        xt = xt + (p_mn(m_out) if p_mn is not None else m_out)
+                with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+                    for li, h_n in norm_inputs.items():
+                        a_hat = stu.blocks[li].attn(h_n)
+                        loss_li = _attn_transfer_loss(a_hat, attn_targets[li]) / max(1, len(norm_inputs))
                         loss_li.backward()
                         total_loss = total_loss + loss_li.detach()
-                        a_res = p_an(a_hat.detach()) if p_an is not None else a_hat.detach()
-                        xs = xs + a_res
                         del a_hat, loss_li
-                    else:
-                        a_res = p_an(a_tgt) if p_an is not None else a_tgt
-                        xs = xs + a_res
-                    with torch.no_grad():
-                        m_out = blk.mlp(blk.norm2(xs))
-                        if p_mn is not None:
-                            m_out = p_mn(m_out)
-                        xs = xs + m_out
-                    del a_tgt
-            del xs
-        else:
-            norm_inputs, attn_targets = {}, {}
-            with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-                xt = donor.embed_tokens(x)
-                for li, blk in enumerate(donor.blocks):
-                    h_n = blk.norm1(xt)
-                    a_out = blk.attn(h_n)
-                    if li in bolt3_indices:
-                        norm_inputs[li] = h_n.detach()
-                        attn_targets[li] = a_out.detach()
-                    p_an = getattr(blk, "post_attn_norm", None)
-                    p_mn = getattr(blk, "post_mlp_norm", None)
-                    xt = xt + (p_an(a_out) if p_an is not None else a_out)
-                    m_out = blk.mlp(blk.norm2(xt))
-                    xt = xt + (p_mn(m_out) if p_mn is not None else m_out)
-            with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-                for li, h_n in norm_inputs.items():
-                    a_hat = stu.blocks[li].attn(h_n)
-                    loss_li = _attn_transfer_loss(a_hat, attn_targets[li]) / max(1, len(norm_inputs))
-                    loss_li.backward()
-                    total_loss = total_loss + loss_li.detach()
-                    del a_hat, loss_li
-            del norm_inputs, attn_targets
-        torch.nn.utils.clip_grad_norm_(bolt3_params, 1.0)
-        opt.step()
-        if (s + 1) in (1, max(1, steps // 4), max(1, steps // 2), steps):
-            print(
-                f"    [Stage-1] step {s+1:4d}/{steps} | attn_rel_mse+cos = {float(total_loss.item()):.4f} ({time.perf_counter()-t0:.1f}s)",
-                flush=True,
-            )
+                del norm_inputs, attn_targets
+            torch.nn.utils.clip_grad_norm_(bolt3_params, 1.0)
+            opt.step()
+            if (s + 1) in (1, max(1, steps // 4), max(1, steps // 2), steps):
+                print(
+                    f"    [Stage-1] step {s+1:4d}/{steps} | attn_rel_mse+cos = {float(total_loss.item()):.4f} ({time.perf_counter()-t0:.1f}s)",
+                    flush=True,
+                )
+    finally:
+        _set_cold_blocks(stu, saved_cold, override=None)
 
 
 def _setup_trainable(
@@ -593,9 +609,10 @@ def _setup_trainable(
     device: torch.device,
     freeze_mlp: bool = False,
     train_proj: bool = False,
+    force_freeze_proj: bool = False,
 ):
     bolt3_core, bolt3_proj, mlp_and_norm = [], [], []
-    freeze_proj = bool(stu_cfg.get("bolt3_freeze_proj", True)) and not train_proj
+    freeze_proj = bool(force_freeze_proj) or (bool(stu_cfg.get("bolt3_freeze_proj", True)) and not train_proj)
     b3_layers = {f"blocks.{li}." for li, blk in enumerate(stu.blocks) if isinstance(blk.attn, Bolt3Attn)}
     bolt3_core_keys = ("log_gamma", "kappa", "beta_proj", "eta_proj", "res_norm")
 
@@ -666,107 +683,160 @@ def _kd_microbatch_backward(
     loss_mask: torch.Tensor | None = None,
     tok_slice: int = 512,
     ckpt_stride: int = 1,
-) -> torch.Tensor:
+    evict_loss_w: float = 0.0,
+) -> tuple[torch.Tensor, float]:
     cfg = stu.config
     L_num = int(cfg["num_layers"])
     anchor_every = int(cfg.get("kd_anchor_every", 4))
     device = xm.device
     mask_f = loss_mask.float() if loss_mask is not None else None
+    track_evict = (evict_loss_w > 0.0) and (not is_hf_donor)
+    b3_evict_layers: list[tuple[int, Bolt3Attn, SoftmaxAttn]] = []
+    if track_evict:
+        ev_c = int(cfg.get("bolt3_C", 128))
+        ev_loc = int(cfg.get("bolt3_loc_chunks", 4))
+        ev_sinks = int(cfg.get("bolt3_n_sinks", 4))
+        for li in range(L_num):
+            sb, tb = stu.blocks[li].attn, donor.blocks[li].attn
+            if isinstance(sb, Bolt3Attn) and isinstance(tb, SoftmaxAttn):
+                tb._capture_evict_target = True
+                tb._evict_C, tb._evict_loc_chunks, tb._evict_n_sinks = ev_c, ev_loc, ev_sinks
+                tb._evict_aux = None
+                sb._capture_mres_aux = True
+                sb._mres_aux = None
+                b3_evict_layers.append((li, sb, tb))
 
-    with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
-        with torch.no_grad():
-            if is_hf_donor:
-                h_teacher, t_mids = _forward_hf_teacher_body(donor, xm, L_num, anchor_every)
-            else:
-                xt = donor.embed_tokens(xm)
-                t_mids = []
-                for li, blk in enumerate(donor.blocks):
-                    xt = blk(xt)
-                    if anchor_every > 0 and li < L_num - 1 and (li + 1) % anchor_every == 0:
-                        t_mids.append(xt)
-                h_teacher = donor.norm(xt)
+    try:
+        with torch.autocast("cuda", torch.bfloat16, enabled=(device.type == "cuda")):
+            with torch.no_grad():
+                if is_hf_donor:
+                    h_teacher, t_mids = _forward_hf_teacher_body(donor, xm, L_num, anchor_every)
+                else:
+                    xt = donor.embed_tokens(xm)
+                    t_mids = []
+                    for li, blk in enumerate(donor.blocks):
+                        xt = blk(xt)
+                        if anchor_every > 0 and li < L_num - 1 and (li + 1) % anchor_every == 0:
+                            t_mids.append(xt)
+                    h_teacher = donor.norm(xt)
 
-        xs = stu.embed_tokens(xm)
-        s_mids = []
-        for li, blk in enumerate(stu.blocks):
-            do_ckpt = use_ckpt and (li % max(1, ckpt_stride) == 0)
-            xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False) if do_ckpt else blk(xs)
-            if anchor_every > 0 and li < L_num - 1 and (li + 1) % anchor_every == 0:
-                s_mids.append(xs)
-        h_student = stu.norm(xs)
+            xs = stu.embed_tokens(xm)
+            s_mids = []
+            for li, blk in enumerate(stu.blocks):
+                skip_ckpt = track_evict and isinstance(blk.attn, Bolt3Attn)
+                do_ckpt = use_ckpt and (not skip_ckpt) and (li % max(1, ckpt_stride) == 0)
+                xs = torch.utils.checkpoint.checkpoint(blk, xs, use_reentrant=False) if do_ckpt else blk(xs)
+                if anchor_every > 0 and li < L_num - 1 and (li + 1) % anchor_every == 0:
+                    s_mids.append(xs)
+            h_student = stu.norm(xs)
 
-        def _cos_loss(a, b):
-            return _masked_mean(1.0 - F.cosine_similarity(a.float(), b.float(), dim=-1), mask_f)
+            def _cos_loss(a, b):
+                return _masked_mean(1.0 - F.cosine_similarity(a.float(), b.float(), dim=-1), mask_f)
 
-        mid_loss = (
-            sum(_cos_loss(sm, tm) for sm, tm in zip(s_mids, t_mids)) / max(1, len(s_mids))
-            if s_mids
-            else torch.zeros((), device=device)
+            mid_loss = (
+                sum(_cos_loss(sm, tm) for sm, tm in zip(s_mids, t_mids)) / max(1, len(s_mids))
+                if s_mids
+                else torch.zeros((), device=device)
+            )
+            final_h_loss = _cos_loss(h_student, h_teacher)
+            del s_mids, t_mids
+
+        B_m, T_m, D_m = h_student.shape
+        l_mem_sum = torch.zeros((), device=device, dtype=torch.float32)
+        n_mem_layers = 0
+        if track_evict and b3_evict_layers:
+            start_tok = min(T_m, int(cfg.get("bolt3_loc_chunks", 4)) * int(cfg.get("bolt3_C", 128)))
+            if start_tok < T_m:
+                qa_boost = None
+                if mask_f is not None:
+                    qa_boost = (mask_f[:, start_tok:] > 1.5).unsqueeze(-1).float()
+                for _, sb, tb in b3_evict_layers:
+                    if sb._mres_aux is not None and tb._evict_aux is not None:
+                        yf, we = tb._evict_aux[0][:, start_tok:, :].float(), tb._evict_aux[1][:, start_tok:].unsqueeze(-1).float()
+                        ya, ym_p = sb._mres_aux[0][:, start_tok:, :].float(), sb._mres_aux[1][:, start_tok:, :].float()
+                        act_w = ((we - 0.02) / 0.10).clamp(0.0, 1.0)
+                        tok_w = 0.10 + 4.0 * we
+                        if qa_boost is not None:
+                            act_w = torch.maximum(act_w, qa_boost)
+                            tok_w = tok_w + 3.0 * qa_boost
+                        target = (yf - ya) * act_w
+                        denom_l = yf.pow(2).mean().clamp_min(1e-4)
+                        l_mem_sum = l_mem_sum + (((ym_p - target).pow(2) * tok_w).mean() / denom_l)
+                        n_mem_layers += 1
+                    sb._mres_aux = None
+                    tb._evict_aux = None
+                if n_mem_layers > 0:
+                    l_mem_sum = l_mem_sum / float(n_mem_layers)
+
+        N_m = B_m * T_m
+        hs_2d, ht_2d, ym_1d = h_student.reshape(N_m, D_m), h_teacher.reshape(N_m, D_m), ym.reshape(N_m)
+        m_1d = None if mask_f is None else mask_f.reshape(N_m)
+        denom = float(N_m) if m_1d is None else float(m_1d.sum().clamp_min(1.0).item())
+        dh_2d = torch.empty_like(hs_2d)
+        if stu.config["vocab_size"] > 200_000:
+            tok_slice = min(tok_slice, 1024)
+        w_lm_s_f32 = stu.lm_head.weight.float()
+        w_lm_t_f32 = (
+            w_lm_s_f32
+            if (w_lm_t.data_ptr() == stu.lm_head.weight.data_ptr() and not stu.lm_head.weight.requires_grad)
+            else w_lm_t.float()
         )
-        final_h_loss = _cos_loss(h_student, h_teacher)
-        del s_mids, t_mids
+        loss = torch.zeros((), device=device, dtype=torch.float32)
 
-    B_m, T_m, D_m = h_student.shape
-    N_m = B_m * T_m
-    hs_2d, ht_2d, ym_1d = h_student.reshape(N_m, D_m), h_teacher.reshape(N_m, D_m), ym.reshape(N_m)
-    m_1d = None if mask_f is None else mask_f.reshape(N_m)
-    denom = float(N_m) if m_1d is None else float(m_1d.sum().clamp_min(1.0).item())
-    dh_2d = torch.empty_like(hs_2d)
-    if stu.config["vocab_size"] > 200_000:
-        tok_slice = min(tok_slice, 1024)
-    w_lm_s_f32 = stu.lm_head.weight.float()
-    w_lm_t_f32 = (
-        w_lm_s_f32
-        if (w_lm_t.data_ptr() == stu.lm_head.weight.data_ptr() and not stu.lm_head.weight.requires_grad)
-        else w_lm_t.float()
-    )
-    loss = torch.zeros((), device=device, dtype=torch.float32)
+        with torch.no_grad():
+            for t_lo in range(0, N_m, tok_slice):
+                t_hi = min(t_lo + tok_slice, N_m)
+                hs_c = hs_2d[t_lo:t_hi].float()
+                ht_c = ht_2d[t_lo:t_hi].float()
+                ym_c = ym_1d[t_lo:t_hi]
+                m_c = None if m_1d is None else m_1d[t_lo:t_hi]
 
-    with torch.no_grad():
-        for t_lo in range(0, N_m, tok_slice):
-            t_hi = min(t_lo + tok_slice, N_m)
-            hs_c = hs_2d[t_lo:t_hi].float()
-            ht_c = ht_2d[t_lo:t_hi].float()
-            ym_c = ym_1d[t_lo:t_hi]
-            m_c = None if m_1d is None else m_1d[t_lo:t_hi]
+                slog = F.linear(hs_c, w_lm_s_f32)
+                lsm_s = F.log_softmax(slog, dim=-1)
+                prob_s = lsm_s.exp()
 
-            slog = F.linear(hs_c, w_lm_s_f32)
-            lsm_s = F.log_softmax(slog, dim=-1)
-            prob_s = lsm_s.exp()
+                rlog = F.linear(ht_c, w_lm_t_f32)
+                rlsm = F.log_softmax(rlog, dim=-1)
+                prob_t = rlsm.exp()
+                kd_tok = (prob_t * (rlsm - lsm_s)).sum(-1)
+                kd_i = kd_tok.sum() if m_c is None else (kd_tok * m_c).sum()
+                del rlog, rlsm, kd_tok
 
-            rlog = F.linear(ht_c, w_lm_t_f32)
-            rlsm = F.log_softmax(rlog, dim=-1)
-            prob_t = rlsm.exp()
-            kd_tok = (prob_t * (rlsm - lsm_s)).sum(-1)
-            kd_i = kd_tok.sum() if m_c is None else (kd_tok * m_c).sum()
-            del rlog, rlsm, kd_tok
+                if kd >= 0.999:
+                    loss.add_(kd_i * (w / denom))
+                    g_logits = (prob_s - prob_t) * (w / denom)
+                else:
+                    ce_tok = -lsm_s.gather(-1, ym_c.unsqueeze(-1))[:, 0]
+                    ce_i = ce_tok.sum() if m_c is None else (ce_tok * m_c).sum()
+                    loss.add_(((1.0 - kd) * ce_i + kd * kd_i) * (w / denom))
+                    g_logits = prob_s
+                    g_logits.sub_(prob_t, alpha=kd)
+                    g_logits.scatter_add_(
+                        -1, ym_c.unsqueeze(-1), torch.full_like(ym_c.unsqueeze(-1), -(1.0 - kd), dtype=torch.float32)
+                    )
+                    g_logits.mul_(w / denom)
+                if m_c is not None:
+                    g_logits.mul_(m_c.unsqueeze(-1))
 
-            if kd >= 0.999:
-                loss.add_(kd_i * (w / denom))
-                g_logits = (prob_s - prob_t) * (w / denom)
-            else:
-                ce_tok = -lsm_s.gather(-1, ym_c.unsqueeze(-1))[:, 0]
-                ce_i = ce_tok.sum() if m_c is None else (ce_tok * m_c).sum()
-                loss.add_(((1.0 - kd) * ce_i + kd * kd_i) * (w / denom))
-                g_logits = prob_s
-                g_logits.sub_(prob_t, alpha=kd)
-                g_logits.scatter_add_(
-                    -1, ym_c.unsqueeze(-1), torch.full_like(ym_c.unsqueeze(-1), -(1.0 - kd), dtype=torch.float32)
-                )
-                g_logits.mul_(w / denom)
-            if m_c is not None:
-                g_logits.mul_(m_c.unsqueeze(-1))
+                dh_2d[t_lo:t_hi] = (g_logits @ w_lm_s_f32).to(h_student.dtype)
+                del slog, lsm_s, prob_s, prob_t, g_logits
 
-            dh_2d[t_lo:t_hi] = (g_logits @ w_lm_s_f32).to(h_student.dtype)
-            del slog, lsm_s, prob_s, prob_t, g_logits
-
-    del h_teacher, ht_2d, w_lm_s_f32, w_lm_t_f32
-    torch.autograd.backward(
-        [h_student, (mid_loss + final_h_loss) * (0.20 * w)],
-        [dh_2d.view(B_m, T_m, D_m), torch.ones_like(final_h_loss)],
-    )
-    del h_student, hs_2d, dh_2d, mid_loss, final_h_loss
-    return loss
+        del h_teacher, ht_2d, w_lm_s_f32, w_lm_t_f32
+        b_outs = [h_student, (mid_loss + final_h_loss) * (0.20 * w)]
+        b_grads = [dh_2d.view(B_m, T_m, D_m), torch.ones_like(final_h_loss)]
+        l_mem_val = float(l_mem_sum.detach().item()) * w if n_mem_layers > 0 else 0.0
+        if n_mem_layers > 0:
+            b_outs.append(l_mem_sum * (evict_loss_w * w))
+            b_grads.append(torch.ones((), device=device, dtype=torch.float32))
+        torch.autograd.backward(b_outs, b_grads)
+        del h_student, hs_2d, dh_2d, mid_loss, final_h_loss, l_mem_sum, b_outs, b_grads
+        return loss, l_mem_val
+    finally:
+        for _, sb, tb in b3_evict_layers:
+            tb._capture_evict_target = False
+            tb._evict_aux = None
+            sb._capture_mres_aux = False
+            sb._mres_aux = None
 
 
 def heal_bolt3_model(
@@ -790,10 +860,13 @@ def heal_bolt3_model(
     resume: bool = False,
     freeze_mlp: bool = True,
     train_proj: bool = False,
+    force_freeze_proj: bool = False,
     stage1_onpolicy: bool = False,
     profile: str | None = None,
     ckpt_stride: int | None = None,
     micro_bs_override: int | None = None,
+    evict_loss_w: float = 0.0,
+    mres_tbptt: int | None = None,
 ):
     _purge_zombie_vram()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -811,7 +884,9 @@ def heal_bolt3_model(
     if not donor_repo:
         raise ValueError("Pass --donor <repo_id> or use a checkpoint created by `python -m bolt3 convert`")
 
-    opt_groups, trainable = _setup_trainable(stu, stu_cfg, device, freeze_mlp=freeze_mlp, train_proj=train_proj)
+    opt_groups, trainable = _setup_trainable(
+        stu, stu_cfg, device, freeze_mlp=freeze_mlp, train_proj=train_proj, force_freeze_proj=force_freeze_proj
+    )
 
     n_params = sum(p.numel() for p in stu.parameters())
     T = int(stu_cfg["max_T"])
@@ -846,6 +921,8 @@ def heal_bolt3_model(
 
     if ckpt_stride is not None:
         eff_stride = int(ckpt_stride)
+    if evict_loss_w > 0.0 and T > 2048 and micro_bs_override is None:
+        micro_bs = 1
     if micro_bs_override is not None:
         micro_bs = int(micro_bs_override)
 
@@ -938,40 +1015,58 @@ def heal_bolt3_model(
     from transformers import AutoTokenizer
 
     binder_tok = AutoTokenizer.from_pretrained(donor_dir)
+    saved_cold = _snapshot_cold_blocks(stu)
+    saved_tbptt = {li: blk.attn.mres_tbptt for li, blk in enumerate(stu.blocks) if isinstance(blk.attn, Bolt3Attn)}
+    eff_tbptt = (0 if evict_loss_w > 0.0 else 1) if mres_tbptt is None else int(mres_tbptt)
+    for li in saved_tbptt:
+        stu.blocks[li].attn.mres_tbptt = eff_tbptt
     last_step_done = start_step
     try:
         for step in range(start_step, total_steps):
+            # Force real consolidation/eviction on ALL Bolt-3 layers (2/3 pure evicted O(1) + L_mem, 1/3 cold_cap=2)
+            is_evict_step = (step % 3 != 2)
+            _set_cold_blocks(stu, saved_cold, override=(0 if is_evict_step else 2))
             idx = torch.randint(0, n_win, (bs,), generator=gen)
             base = idx[:, None] * T + ar[None, :]
             x, y = train_tokens[base].long(), train_tokens[base + 1].long()
-            if step % 4 == 0 and T >= 128:
+            l_weights = None
+            if step % 3 != 1 and T >= 128:
                 rng_n = random.Random(700000 + step)
+                l_weights = torch.ones((bs, T), dtype=torch.float32)
                 for r_i in range(bs):
-                    s1, s2 = rng_n.sample(("Orion", "Hemlock", "Vanguard", "Chronos", "Lyra", "Titan"), 2)
-                    c1, c2 = rng_n.randint(10000, 99999), rng_n.randint(10000, 99999)
-                    nd1 = binder_tok.encode(f" [MEMO: Secret code for Project {s1} is {c1}.] ", add_special_tokens=False)
-                    nd2 = binder_tok.encode(f" [MEMO: Secret code for Project {s2} is {c2}.] ", add_special_tokens=False)
-                    qs, qc = (s1, c1) if r_i % 2 == 0 else (s2, c2)
-                    qa = binder_tok.encode(
-                        f"\nQuestion: What is the secret code for Project {qs}? Answer: {qc}.",
+                    projs = rng_n.sample(("Orion", "Hemlock", "Vanguard", "Chronos", "Lyra", "Titan"), 3)
+                    codes = [rng_n.randint(10000, 99999) for _ in range(3)]
+                    nds = [binder_tok.encode(f" [MEMO: Secret code for Project {s_} is {c_}.] ", add_special_tokens=False) for s_, c_ in zip(projs, codes)]
+                    q_idx = r_i % 3
+                    qs, qc = projs[q_idx], codes[q_idx]
+                    qa_q = binder_tok.encode(
+                        f"\nQuestion: What is the secret code for Project {qs}? Answer:",
                         add_special_tokens=False,
                     )
+                    qa_a = binder_tok.encode(f" {qc}.", add_special_tokens=False)
+                    qa = qa_q + qa_a
                     row_seq = x[r_i].tolist() + [int(y[r_i, -1].item())]
-                    p1 = rng_n.randint(16, max(17, T // 6))
-                    p2 = rng_n.randint(max(18, T // 4), max(19, T // 2))
-                    if p1 + len(nd1) < p2 and p2 + len(nd2) < len(row_seq) - len(qa) - 4:
-                        row_seq[p1 : p1 + len(nd1)] = nd1
-                        row_seq[p2 : p2 + len(nd2)] = nd2
+                    p1 = rng_n.randint(16, max(17, T // 8))
+                    p2 = rng_n.randint(max(p1 + len(nds[0]) + 16, T // 6), max(p1 + len(nds[0]) + 17, T // 3))
+                    p3 = rng_n.randint(max(p2 + len(nds[1]) + 16, T // 2), max(p2 + len(nds[1]) + 17, min(len(row_seq) - len(qa) - len(nds[2]) - 8, 3 * T // 5)))
+                    if p3 + len(nds[2]) < len(row_seq) - len(qa) - 4:
+                        for p_, nd_ in ((p1, nds[0]), (p2, nds[1]), (p3, nds[2])):
+                            row_seq[p_ : p_ + len(nd_)] = nd_
                         row_seq[-len(qa) :] = qa
                         t_r = torch.tensor(row_seq[: T + 1], dtype=torch.long)
                         x[r_i], y[r_i] = t_r[:-1], t_r[1:]
+                        if len(qa_a) > 0:
+                            l_weights[r_i, -len(qa_a) :] = 8.0
 
             opt.zero_grad(set_to_none=True)
             loss_gpu = torch.zeros((), device=device, dtype=torch.float32)
+            l_mem_accum = 0.0
+            step_evict_w = evict_loss_w if is_evict_step else 0.0
             for lo in range(0, bs, micro_bs):
                 hi = min(lo + micro_bs, bs)
                 xm, ym = x[lo:hi].to(device, non_blocking=True), y[lo:hi].to(device, non_blocking=True)
-                loss_gpu += _kd_microbatch_backward(
+                lm_m = l_weights[lo:hi].to(device, non_blocking=True) if l_weights is not None else None
+                loss_mb, l_mem_mb = _kd_microbatch_backward(
                     stu,
                     donor,
                     is_hf_donor,
@@ -981,8 +1076,12 @@ def heal_bolt3_model(
                     (hi - lo) / bs,
                     kd,
                     use_ckpt,
+                    loss_mask=lm_m,
                     ckpt_stride=eff_stride,
+                    evict_loss_w=step_evict_w,
                 )
+                loss_gpu += loss_mb
+                l_mem_accum += l_mem_mb
 
             gn_tensor = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             if torch.isfinite(gn_tensor):
@@ -997,13 +1096,19 @@ def heal_bolt3_model(
                 dt = (now - t_window) / max(1, step_done - step_window)
                 t_window, step_window = now, step_done
                 peak_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
+                b3_mods = [stu.blocks[li].attn for li in saved_tbptt]
+                bw_m = sum(float(m.beta_proj.weight.detach().float().norm()) for m in b3_mods) / max(1, len(b3_mods))
+                ew_m = sum(float(m.eta_proj.weight.detach().float().norm()) for m in b3_mods) / max(1, len(b3_mods))
+                rr_m = sum(float(m.res_norm.weight.detach().float().pow(2).mean().sqrt()) for m in b3_mods) / max(1, len(b3_mods))
                 print(
-                    f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_ce {loss_val:.4f}  gnorm {gn:.2f}  "
+                    f"  [{out_prefix}] step {step_done:5d}/{total_steps}  kd_ce {loss_val:.4f}  l_mem {l_mem_accum:.4f}  "
+                    f"|bW|={bw_m:.2f} |eW|={ew_m:.2f} res={rr_m:.3f}  gnorm {gn:.2f}  "
                     f"toks {step_done*bs*T/1e6:.2f}M  {dt:.2f}s/it  VRAM {peak_gb:.2f} GiB",
                     flush=True,
                 )
 
             if step_done % eval_every == 0 or step_done == total_steps:
+                _set_cold_blocks(stu, saved_cold, override=None)
                 s_ppl, d_ppl, kl_v, top1_v = _eval_reasoning_metrics(stu, donor, is_hf_donor, eval_tokens, device, bs=2)
                 stu.train()
                 now = time.perf_counter()
@@ -1017,6 +1122,7 @@ def heal_bolt3_model(
                 )
 
             if step_done % save_every == 0 or step_done == total_steps:
+                _set_cold_blocks(stu, saved_cold, override=None)
                 _save_student(
                     stu,
                     stu_cfg,
@@ -1032,10 +1138,15 @@ def heal_bolt3_model(
                     _upload_hf(out_ckpt, hf_repo, sync=(step_done == total_steps))
     except KeyboardInterrupt:
         print(f"\n  [{out_prefix}] Interrupted at step {last_step_done} — saving checkpoint...", flush=True)
+        _set_cold_blocks(stu, saved_cold, override=None)
         _save_student(stu, stu_cfg, ck, out_ckpt, last_step_done, opt=opt, opt_ckpt=opt_ckpt)
         if hf_repo:
             _upload_hf(out_ckpt, hf_repo, sync=True)
         raise
+    finally:
+        _set_cold_blocks(stu, saved_cold, override=None)
+        for li_tb, orig_tb in saved_tbptt.items():
+            stu.blocks[li_tb].attn.mres_tbptt = orig_tb
 
     return out_ckpt
 
@@ -1229,12 +1340,12 @@ def onpolicy_distill(
                 ym = seq[1:].view(1, -1).to(device)
                 pos = torch.arange(xm.shape[1], device=device)
                 mask = (pos >= P - 1).view(1, -1)
-                loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, w, 1.0, True, loss_mask=mask)
+                loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, w, 1.0, True, loss_mask=mask)[0]
             for i0 in torch.randint(0, n_win, (seqs_per_step,), generator=corpus_gen)[:n_corpus].tolist():
                 base = i0 * T + ar
                 xm = train_tokens[base].long().view(1, -1).to(device)
                 ym = train_tokens[base + 1].long().view(1, -1).to(device)
-                loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, w, 1.0, True)
+                loss_gpu += _kd_microbatch_backward(stu, donor, is_hf_donor, w_lm_t, xm, ym, w, 1.0, True)[0]
             gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             if torch.isfinite(gn):
                 opt.step()

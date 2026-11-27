@@ -49,6 +49,9 @@ def main(argv: list[str] | None = None):
     p_heal.add_argument("--freeze-mlp", action="store_true", default=True, help="Freeze donor MLPs/norms (default: True)")
     p_heal.add_argument("--unfreeze-mlp", action="store_true", help="Unfreeze donor MLPs/norms during healing")
     p_heal.add_argument("--train-proj", action="store_true", help="Also train q/k/v/o projections")
+    p_heal.add_argument("--freeze-proj", action="store_true", help="Force freeze q/k/v/o projections during healing")
+    p_heal.add_argument("--evict-loss", type=float, default=0.0, help="Weight of L_mem evicted-mass supervision loss (Step 2b)")
+    p_heal.add_argument("--mres-tbptt", type=int, default=None, help="Chunk horizon before M_res detach (0 = full-seq unrolled)")
     p_heal.add_argument("--profile", choices=["reasoning", "chat", "base"], default=None)
     p_heal.add_argument("--ckpt-stride", type=int, default=None, help="Activation checkpoint block stride override")
     p_heal.add_argument("--micro-bs", type=int, default=None, help="Micro-batch size override")
@@ -158,10 +161,13 @@ def main(argv: list[str] | None = None):
             resume=args.resume,
             freeze_mlp=(not args.unfreeze_mlp),
             train_proj=args.train_proj,
+            force_freeze_proj=args.freeze_proj,
             stage1_onpolicy=args.stage1_onpolicy,
             profile=args.profile,
             ckpt_stride=args.ckpt_stride,
             micro_bs_override=args.micro_bs,
+            evict_loss_w=args.evict_loss,
+            mres_tbptt=args.mres_tbptt,
         )
     elif args.cmd == "onpolicy":
         from .converter import onpolicy_distill

@@ -846,13 +846,23 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
             kv_s[li]["sink_v"] = torch.randn_like(kv_s[li]["sink_k"])
             kv_s[li]["sink_valid"] = torch.ones(1, 1, ly.n_sinks, device=device, dtype=torch.bool)
             kv_s[li]["sink_filled"] = torch.full((1,), ly.n_sinks, device=device, dtype=torch.long)
-            kv_s[li]["prev_kr"] = torch.randn(1, ly.HKV, ly.C, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
-            kv_s[li]["prev_kp"] = torch.randn_like(kv_s[li]["prev_kr"])
-            kv_s[li]["prev_v"] = torch.randn_like(kv_s[li]["prev_kr"])
-            kv_s[li]["prev_pos"] = torch.arange(t_ctx - ly.C, t_ctx, device=device, dtype=torch.float32).view(1, 1, ly.C)
-            kv_s[li]["prev_b"] = torch.full((1, ly.HKV, ly.C), 0.25, device=device, dtype=torch.bfloat16)
-            kv_s[li]["prev_valid"] = torch.ones(1, 1, ly.C, device=device, dtype=torch.bool)
-            total_past_blks = max(0, t_ctx // ly.C - 1)
+            l_span = ly.loc_chunks * ly.C
+            filled_chunks = min(max(0, ly.loc_chunks - 1), t_ctx // ly.C)
+            filled_toks = filled_chunks * ly.C
+            kv_s[li]["loc_k"] = torch.randn(1, ly.HKV, l_span, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
+            kv_s[li]["loc_v"] = torch.randn_like(kv_s[li]["loc_k"])
+            kv_s[li]["loc_pos"] = torch.zeros(1, 1, l_span, device=device, dtype=torch.float32)
+            if filled_toks > 0:
+                kv_s[li]["loc_pos"][:, :, :filled_toks] = torch.arange(t_ctx - filled_toks, t_ctx, device=device, dtype=torch.float32).view(1, 1, filled_toks)
+            kv_s[li]["loc_b"] = torch.full((1, ly.HKV, l_span), 0.25, device=device, dtype=torch.bfloat16)
+            lv = torch.zeros(1, 1, l_span, device=device, dtype=torch.bool)
+            if filled_toks > 0:
+                lv[:, :, :filled_toks] = True
+            kv_s[li]["loc_valid"] = lv
+            kv_s[li]["loc_slot_pad"] = [False] * ly.loc_chunks
+            kv_s[li]["cur_slot"] = filled_chunks % ly.loc_chunks
+            kv_s[li]["n_loc_filled"] = filled_chunks
+            total_past_blks = max(0, t_ctx // ly.C - max(1, ly.loc_chunks - 1))
             if getattr(ly, "is_cold_armed", False) and ly.max_cold_blocks > 0:
                 n_cb = min(ly.max_cold_blocks, total_past_blks)
                 if n_cb > 0:
@@ -864,10 +874,12 @@ def eval_real_speed_and_ram(stu, hf_donor, cfg: dict, tok, device: torch.device)
                     kv_s[li]["cold_mask"] = cm_b
                     kv_s[li]["cold_pos"] = torch.zeros(1, 1, n_cb, ly.C, device=device, dtype=torch.float32)
                     kv_s[li]["cold_b"] = torch.full((1, ly.HKV, n_cb, ly.C), 0.25, device=device, dtype=torch.bfloat16)
+                    kv_s[li]["cold_hit"] = torch.zeros(1, ly.HKV, n_cb, ly.C, device=device, dtype=torch.float32)
                     if ly.cold_topk > 0:
                         kv_s[li]["cold_kmin"] = ck_b.amin(dim=3)
                         kv_s[li]["cold_kmax"] = ck_b.amax(dim=3)
             if not getattr(ly, "is_cold_armed", False) or total_past_blks > ly.max_cold_blocks:
+                states_s[li] = torch.randn(1, ly.HKV, ly.HD, ly.HD, device=device, dtype=torch.float32) * 0.01
                 kv_s[li]["ak"] = torch.randn(ly.HKV, ly.S, ly.HD, device=device, dtype=torch.bfloat16) * 0.02
                 kv_s[li]["av"] = torch.randn_like(kv_s[li]["ak"])
                 kv_s[li]["mass"] = torch.ones(ly.HKV, ly.S, device=device, dtype=torch.float32)

@@ -138,13 +138,14 @@ def test_gradients_flow():
                 if any(k in n for k in FP32_KEYS):
                     assert p.grad is not None and torch.isfinite(p.grad).all(), f"Missing/non-finite grad for {n}"
 
-    # Verify non-zero gradients across both merge (kappa) and M_res paths once eta_proj opens
+    # Verify non-zero gradients across both prototype (kappa) and M_res paths once eta_proj opens
     with torch.no_grad():
         for blk in model.blocks:
             blk.attn.eta_proj.bias.fill_(0.25)
     model.zero_grad(set_to_none=True)
-    pat = torch.randint(0, 256, (2, 16), device=dev)
-    x = torch.cat([pat, pat, pat, torch.randint(0, 256, (2, 32), device=dev)], dim=1)
+    pat8 = torch.randint(0, 256, (2, 8), device=dev)
+    chunk_rep = torch.cat([pat8, pat8], dim=1)
+    x = torch.cat([chunk_rep] * 5 + [torch.randint(0, 256, (2, 16), device=dev)], dim=1)
     model.lm_head(model(x)).pow(2).mean().backward()
     for blk in model.blocks:
         for n, p in blk.attn.named_parameters():
@@ -176,11 +177,12 @@ def test_memorize_forget_and_state_bytes():
     assert flat > 0 and per_tok == 0
 
     dec = Bolt3Decoder(model)
-    doc = torch.randint(0, 256, (1, 48), device=dev)
+    doc = torch.randint(0, 256, (1, 80), device=dev)
     probe = torch.randint(0, 256, (1, 16), device=dev)
 
     states, kv = Bolt3Decoder.blank_state(model, 1, dev)
     states, kv, pos, traces = dec.memorize(doc, states, kv, 0)
+    assert max(float(s.abs().max().item()) for s in states) > 0.0
     states = dec.forget(traces, states, next_pos=pos)
     zero_err = max(float(s.abs().max().item()) for s in states)
 
@@ -274,8 +276,8 @@ def test_left_padded_batch_parity():
 
     dec = Bolt3Decoder(model)
     p1 = torch.randint(1, 256, (1, 14), device=dev)   # < 1 chunk
-    p2 = torch.randint(1, 256, (1, 53), device=dev)   # > 3 chunks (triggers sinks, attractors, M_res)
-    max_l = 53
+    p2 = torch.randint(1, 256, (1, 70), device=dev)   # > 4 chunks (triggers sinks, attractors, M_res)
+    max_l = 70
     ids_b = torch.zeros((2, max_l), dtype=torch.long, device=dev)
     mask_b = torch.zeros((2, max_l), dtype=torch.long, device=dev)
     ids_b[0, max_l - 14 :] = p1[0]
@@ -285,7 +287,7 @@ def test_left_padded_batch_parity():
 
     with torch.no_grad():
         ref1 = dec.generate(p1, 10, temperature=0.0)[0, 14:].tolist()
-        ref2 = dec.generate(p2, 10, temperature=0.0)[0, 53:].tolist()
+        ref2 = dec.generate(p2, 10, temperature=0.0)[0, 70:].tolist()
         batched, _ = dec.generate_batch(ids_b, 10, temperature=0.0, attn_mask=mask_b)
         b1, b2 = batched[0].tolist(), batched[1].tolist()
     assert b1 == ref1 and b2 == ref2
