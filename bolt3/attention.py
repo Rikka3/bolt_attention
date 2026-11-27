@@ -4,7 +4,12 @@ and Gershgorin Eviction-to-Delta Residual Associative Memory (M_res).
 from __future__ import annotations
 
 import itertools
+import os
+import shutil
+import uuid
+from collections import OrderedDict
 from contextlib import nullcontext
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -39,6 +44,99 @@ class StaticKV:
         self.v[:, :, self.n : self.n + L] = v_new
         self.n += L
         return self.k[:, :, : self.n], self.v[:, :, : self.n]
+
+
+class _Tier2BlockStore:
+    """Off-GPU cold KV block overflow store (CPU host RAM or disk `.vsa` block pages with LRU cache)."""
+
+    def __init__(
+        self,
+        layer_idx: int,
+        base_dir: str | Path | None = None,
+        cache_blocks: int = 128,
+        session_dir: Path | None = None,
+    ):
+        self.layer_idx = int(layer_idx)
+        self.cache_blocks = max(0, int(cache_blocks))
+        self.base_dir = Path(base_dir) if base_dir is not None else None
+        self.session_dir = session_dir
+        if self.base_dir is not None and self.session_dir is None:
+            self.session_dir = self.base_dir / f"t2_{uuid.uuid4().hex[:10]}"
+        self.layer_dir = (self.session_dir / f"L{self.layer_idx}") if self.session_dir is not None else None
+        if self.layer_dir is not None:
+            self.layer_dir.mkdir(parents=True, exist_ok=True)
+        self.n_blocks = 0
+        self._cpu_blocks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._paths: list[Path] = []
+        self._lru: OrderedDict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = OrderedDict()
+
+    def _lru_put(self, idx: int, item: tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        if self.cache_blocks <= 0:
+            return
+        if idx in self._lru:
+            self._lru.move_to_end(idx)
+        self._lru[idx] = item
+        while len(self._lru) > self.cache_blocks:
+            self._lru.popitem(last=False)
+
+    def append(self, ok_p: torch.Tensor, ok_v: torch.Tensor, ok_m: torch.Tensor) -> int:
+        idx = self.n_blocks
+        k_cpu = ok_p.detach().cpu().contiguous()
+        v_cpu = ok_v.detach().cpu().contiguous()
+        m_cpu = ok_m.detach().cpu().bool().contiguous()
+        item = (k_cpu, v_cpu, m_cpu)
+        if self.layer_dir is not None:
+            p = self.layer_dir / f"blk_{idx:05d}.vsa"
+            tmp = p.with_suffix(".vsa.tmp")
+            torch.save({"k": k_cpu, "v": v_cpu, "m": m_cpu}, tmp, _use_new_zipfile_serialization=False)
+            os.replace(tmp, p)
+            self._paths.append(p)
+            self._lru_put(idx, item)
+        else:
+            self._cpu_blocks.append(item)
+        self.n_blocks += 1
+        return idx
+
+    def fetch(self, idxs: list[int], device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ks, vs, ms = [], [], []
+        for idx in idxs:
+            if self.layer_dir is not None:
+                hit = self._lru.get(idx)
+                if hit is not None:
+                    self._lru.move_to_end(idx)
+                else:
+                    d = torch.load(self._paths[idx], map_location="cpu", weights_only=False)
+                    hit = (d["k"], d["v"], d["m"])
+                    self._lru_put(idx, hit)
+                k_c, v_c, m_c = hit
+            else:
+                k_c, v_c, m_c = self._cpu_blocks[idx]
+            ks.append(k_c)
+            vs.append(v_c)
+            ms.append(m_c)
+        k_t = torch.stack(ks, dim=2).to(device=device, dtype=dtype)
+        v_t = torch.stack(vs, dim=2).to(device=device, dtype=dtype)
+        m_t = torch.stack(ms, dim=2).to(device=device, dtype=torch.bool)
+        return k_t, v_t, m_t
+
+    def close(self):
+        self._cpu_blocks.clear()
+        self._paths.clear()
+        self._lru.clear()
+        if self.layer_dir is not None and self.layer_dir.exists():
+            shutil.rmtree(self.layer_dir, ignore_errors=True)
+        if self.session_dir is not None and self.session_dir.exists():
+            try:
+                if not any(self.session_dir.iterdir()):
+                    self.session_dir.rmdir()
+            except OSError:
+                pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class Bolt3Attn(nn.Module):
@@ -440,6 +538,7 @@ class Bolt3Attn(nn.Module):
         p_mask: torch.Tensor,
         p_pos: torch.Tensor,
         p_b: torch.Tensor,
+        max_cold_blocks: int | None = None,
     ):
         """Append one chunk `(b, HKV, C, HD)` to cold memory; pop oldest block if past `max_cold_blocks`."""
         kb = p_kp.unsqueeze(2)
@@ -471,8 +570,9 @@ class Bolt3Attn(nn.Module):
                 cold_kmin = torch.cat([cold_kmin, kmin_new], dim=2)
                 cold_kmax = torch.cat([cold_kmax, kmax_new], dim=2)
 
+        cap_blks = self.max_cold_blocks if max_cold_blocks is None else max(0, int(max_cold_blocks))
         popped = None
-        if cold_k.shape[2] > self.max_cold_blocks:
+        if cold_k.shape[2] > cap_blks:
             popped = (
                 cold_k[:, :, 0],
                 cold_v[:, :, 0],
@@ -490,6 +590,46 @@ class Bolt3Attn(nn.Module):
                 cold_kmax = cold_kmax[:, :, 1:]
         return cold_k, cold_v, cold_m, cold_pos, cold_b, cold_kmin, cold_kmax, popped
 
+    @staticmethod
+    def _interval_topk_indices(
+        qp5: torch.Tensor, kmin: torch.Tensor, kmax: torch.Tensor, topk: int
+    ) -> torch.Tensor:
+        kmax6 = kmax.float().unsqueeze(2).unsqueeze(2)
+        kmin6 = kmin.float().unsqueeze(2).unsqueeze(2)
+        ub = (qp5.clamp_min(0) * kmax6 + qp5.clamp_max(0) * kmin6).sum(-1).amax(dim=2)
+        return torch.topk(ub, k=topk, dim=-1, largest=True).indices
+
+    @staticmethod
+    def _gather_interval_blocks(
+        qp5: torch.Tensor,
+        scale: float,
+        k_src: torch.Tensor,
+        v_src: torch.Tensor,
+        m_src: torch.Tensor,
+        top_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, hkv, _, t_q, _, hd = qp5.shape
+        k_cnt = top_idx.shape[-1]
+        c_sz = k_src.shape[3]
+        gk = top_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, c_sz, hd)
+        k_sel = torch.gather(k_src.unsqueeze(2).expand(-1, -1, t_q, -1, -1, -1), 3, gk).reshape(
+            b, hkv, 1, t_q, k_cnt * c_sz, hd
+        )
+        v_sel = torch.gather(v_src.unsqueeze(2).expand(-1, -1, t_q, -1, -1, -1), 3, gk).reshape(
+            b, hkv, 1, t_q, k_cnt * c_sz, hd
+        )
+        m_sel = torch.gather(
+            m_src.expand(b, hkv, -1, -1).unsqueeze(2).expand(-1, -1, t_q, -1, -1),
+            3,
+            top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, c_sz),
+        ).reshape(b, hkv, 1, t_q, k_cnt * c_sz)
+        s_sel = (qp5 * k_sel.float()).sum(-1) * scale
+        s_sel = s_sel.masked_fill(~m_sel, float("-inf"))
+        p_sel = torch.where(m_sel, F.softmax(s_sel, dim=-1), 0.0)
+        lse_sel = torch.logsumexp(s_sel, dim=-1, keepdim=True)
+        y_sel = (p_sel.to(v_sel.dtype).unsqueeze(-1) * v_sel).sum(dim=4).float()
+        return lse_sel, y_sel, p_sel
+
     def _attend_with_cold(
         self,
         qg: torch.Tensor,
@@ -503,86 +643,106 @@ class Bolt3Attn(nn.Module):
         att_slice: tuple[int, int] | None = None,
         loc_slice: tuple[int, int] | None = None,
         q_valid_mask: torch.Tensor | None = None,
+        tier2_topk: int = 0,
+        t2_store: _Tier2BlockStore | None = None,
+        t2_kmin: torch.Tensor | None = None,
+        t2_kmax: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Exact attention over `[sink, ak, loc]` plus optional cold blocks (all or interval top-k)."""
+        """Exact attention over `[sink, ak, loc]` plus Tier-1 GPU cold blocks and optional Tier-2 `.vsa` fault-in."""
         b, hkv, g_sz, t_q, hd = qg.shape
         scale = self.attn_scale
         q_vm = q_valid_mask.view(b, 1, 1, t_q, 1).float() if q_valid_mask is not None else None
-        if cold_k is None or cold_k.shape[2] == 0:
-            scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
-            v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
+        has_t1 = cold_k is not None and cold_k.shape[2] > 0
+        n_cb = int(cold_k.shape[2]) if has_t1 else 0
+        t1_topk_mode = bool(has_t1 and self.cold_topk > 0 and n_cb > self.cold_topk)
+        has_t2 = bool(tier2_topk > 0 and t2_store is not None and t2_kmin is not None and t2_kmin.shape[2] > 0)
+
+        # Tier-1 base calculation yielding (y_base_f32, lse_base) + unscaled base probs
+        cold_off = None
+        if not t1_topk_mode:
+            if not has_t1:
+                scores = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
+                v_cat = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
+            else:
+                c_sz = cold_k.shape[3]
+                kc = cold_k.reshape(b, hkv, n_cb * c_sz, hd)
+                vc = cold_v.reshape(b, hkv, n_cb * c_sz, hd)
+                mc = cold_m.reshape(b, 1, 1, 1, n_cb * c_sz)
+                s_cold = torch.matmul(qg.float(), kc.float().unsqueeze(2).transpose(-1, -2)) * scale
+                s_cold = s_cold.masked_fill(~mc, float("-inf"))
+                scores = torch.cat(sp + [s_cold], dim=-1)
+                v_cat = torch.cat(vp + [vc], dim=2)
+                cold_off = sum(t.shape[-1] for t in sp)
             probs = F.softmax(scores, dim=-1)
+            y_base = torch.matmul(probs.to(v_cat.dtype), v_cat.unsqueeze(2)).float()
+            v_dtype = v_cat.dtype
+            lse_base = torch.logsumexp(scores, dim=-1, keepdim=True) if has_t2 else None
+            p_c = top_idx = c_sz_t1 = None
             probs_w = probs * q_vm if q_vm is not None else probs
-            att_p = probs_w[..., att_slice[0] : att_slice[1]] if att_slice is not None else None
-            loc_p = probs_w[..., loc_slice[0] : loc_slice[1]] if loc_slice is not None else None
-            y = torch.matmul(probs.to(v_cat.dtype), v_cat.unsqueeze(2)).reshape(b, self.H, t_q, hd)
-            return y, att_p, loc_p, None
+        else:
+            c_sz_t1 = cold_k.shape[3]
+            if cold_kmin is None or cold_kmax is None:
+                m_exp = cold_m.unsqueeze(-1).expand(b, hkv, n_cb, c_sz_t1, hd)
+                cold_kmin = cold_k.masked_fill(~m_exp, 1e4).amin(dim=3)
+                cold_kmax = cold_k.masked_fill(~m_exp, -1e4).amax(dim=3)
+            qp5_t1 = qg.float().unsqueeze(4)
+            top_idx = self._interval_topk_indices(qp5_t1, cold_kmin, cold_kmax, self.cold_topk)
+            lse_c, y_c, p_c = self._gather_interval_blocks(qp5_t1, scale, cold_k, cold_v, cold_m, top_idx)
+            scores_o = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
+            v_o = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
+            v_dtype = v_o.dtype
+            lse_o = torch.logsumexp(scores_o, dim=-1, keepdim=True)
+            lse_base = torch.logaddexp(lse_o, lse_c)
+            w_o = torch.exp(lse_o - lse_base)
+            w_c = torch.exp(lse_c - lse_base)
+            p_o = F.softmax(scores_o, dim=-1)
+            y_o = torch.matmul(p_o.to(v_o.dtype), v_o.unsqueeze(2)).float()
+            y_base = w_o * y_o + w_c * y_c
+            probs_w = p_o * (w_o * q_vm if q_vm is not None else w_o)
+            p_c = p_c * (w_c * q_vm if q_vm is not None else w_c)
 
-        n_cb, c_sz = cold_k.shape[2], cold_k.shape[3]
-        if self.cold_topk <= 0 or n_cb <= self.cold_topk:
-            kc = cold_k.reshape(b, hkv, n_cb * c_sz, hd)
-            vc = cold_v.reshape(b, hkv, n_cb * c_sz, hd)
-            mc = cold_m.reshape(b, 1, 1, 1, n_cb * c_sz)
-            s_cold = torch.matmul(qg.float(), kc.float().unsqueeze(2).transpose(-1, -2)) * scale
-            s_cold = s_cold.masked_fill(~mc, float("-inf"))
-            scores = torch.cat(sp + [s_cold], dim=-1)
-            v_cat = torch.cat(vp + [vc], dim=2)
-            cold_off = sum(t.shape[-1] for t in sp)
-            probs = F.softmax(scores, dim=-1)
-            probs_w = probs * q_vm if q_vm is not None else probs
-            att_p = probs_w[..., att_slice[0] : att_slice[1]] if att_slice is not None else None
-            loc_p = probs_w[..., loc_slice[0] : loc_slice[1]] if loc_slice is not None else None
-            cold_delta = (
-                probs_w[..., cold_off : cold_off + n_cb * c_sz].mean(dim=2).sum(dim=2).view(b, hkv, n_cb, c_sz)
-            )
-            y = torch.matmul(probs.to(v_cat.dtype), v_cat.unsqueeze(2)).reshape(b, self.H, t_q, hd)
-            return y, att_p, loc_p, cold_delta
+        # Tier-2 interval-bounded `.vsa` fault-in & exact global LogSumExp merge (micro-sliced on t_q > 32)
+        if has_t2:
+            n_t2 = int(t2_kmin.shape[2])
+            k2 = min(tier2_topk, n_t2)
+            qp5_all = qg.float().unsqueeze(4)
+            top2_idx = self._interval_topk_indices(qp5_all, t2_kmin, t2_kmax, k2)
+            y_parts = []
+            w1_parts = []
+            q_step = 32 if t_q > 32 else t_q
+            for qs in range(0, t_q, q_step):
+                qe = min(t_q, qs + q_step)
+                t_sub = top2_idx[:, :, qs:qe, :]
+                u_ids, remap_flat = torch.unique(t_sub.reshape(-1), sorted=True, return_inverse=True)
+                k_u, v_u, m_u = t2_store.fetch(u_ids.tolist(), device=qg.device, dtype=v_dtype)
+                t_sub_local = remap_flat.view(b, hkv, qe - qs, k2)
+                lse_2, y_2, _ = self._gather_interval_blocks(qp5_all[:, :, :, qs:qe], scale, k_u, v_u, m_u, t_sub_local)
+                lse_1_s = lse_base[:, :, :, qs:qe]
+                lse_all = torch.logaddexp(lse_1_s, lse_2)
+                w_1 = torch.exp(lse_1_s - lse_all)
+                w_2 = torch.exp(lse_2 - lse_all)
+                y_parts.append(w_1 * y_base[:, :, :, qs:qe] + w_2 * y_2)
+                w1_parts.append(w_1)
+            y_final = y_parts[0] if len(y_parts) == 1 else torch.cat(y_parts, dim=3)
+            w_1_full = w1_parts[0] if len(w1_parts) == 1 else torch.cat(w1_parts, dim=3)
+            probs_w = probs_w * w_1_full
+            if p_c is not None:
+                p_c = p_c * w_1_full
+        else:
+            y_final = y_base
 
-        # Top-k cold blocks selected per query token via interval bounds [kmin, kmax], merged via logsumexp.
-        if cold_kmin is None or cold_kmax is None:
-            m_exp = cold_m.unsqueeze(-1).expand(b, hkv, n_cb, c_sz, hd)
-            cold_kmin = cold_k.masked_fill(~m_exp, 1e4).amin(dim=3)
-            cold_kmax = cold_k.masked_fill(~m_exp, -1e4).amax(dim=3)
-        qp5 = qg.float().unsqueeze(4)
-        kmax6 = cold_kmax.float().unsqueeze(2).unsqueeze(2)
-        kmin6 = cold_kmin.float().unsqueeze(2).unsqueeze(2)
-        ub = (qp5.clamp_min(0) * kmax6 + qp5.clamp_max(0) * kmin6).sum(-1).amax(dim=2)  # (b, hkv, t_q, n_cb)
-        top_idx = torch.topk(ub, k=self.cold_topk, dim=-1, largest=True).indices  # (b, hkv, t_q, K)
-        gk = top_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, c_sz, hd)
-        k_sel = torch.gather(cold_k.unsqueeze(2).expand(-1, -1, t_q, -1, -1, -1), 3, gk).reshape(
-            b, hkv, 1, t_q, self.cold_topk * c_sz, hd
-        )
-        v_sel = torch.gather(cold_v.unsqueeze(2).expand(-1, -1, t_q, -1, -1, -1), 3, gk).reshape(
-            b, hkv, 1, t_q, self.cold_topk * c_sz, hd
-        )
-        m_sel = torch.gather(
-            cold_m.expand(b, hkv, -1, -1).unsqueeze(2).expand(-1, -1, t_q, -1, -1),
-            3,
-            top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, c_sz),
-        ).reshape(b, hkv, 1, t_q, self.cold_topk * c_sz)
-        s_cold = (qp5 * k_sel.float()).sum(-1) * scale
-        s_cold = s_cold.masked_fill(~m_sel, float("-inf"))
-
-        scores_o = torch.cat(sp, dim=-1) if len(sp) > 1 else sp[0]
-        v_o = torch.cat(vp, dim=2) if len(vp) > 1 else vp[0]
-        lse_o = torch.logsumexp(scores_o, dim=-1, keepdim=True)
-        lse_c = torch.logsumexp(s_cold, dim=-1, keepdim=True)
-        lse_all = torch.logaddexp(lse_o, lse_c)
-        w_o = torch.exp(lse_o - lse_all)
-        w_c = torch.exp(lse_c - lse_all)
-
-        p_o = F.softmax(scores_o, dim=-1)
-        p_c = torch.where(m_sel, F.softmax(s_cold, dim=-1), 0.0)
-        y_o = torch.matmul(p_o.to(v_o.dtype), v_o.unsqueeze(2)).float()
-        y_c = (p_c.to(v_sel.dtype).unsqueeze(-1) * v_sel).sum(dim=4).float()
-        y = (w_o * y_o + w_c * y_c).to(v_o.dtype).reshape(b, self.H, t_q, hd)
-        p_ow = p_o * (w_o * q_vm if q_vm is not None else w_o)
-        p_cw = (p_c * (w_c * q_vm if q_vm is not None else w_c)).mean(dim=2)
-        att_p = p_ow[..., att_slice[0] : att_slice[1]] if att_slice is not None else None
-        loc_p = p_ow[..., loc_slice[0] : loc_slice[1]] if loc_slice is not None else None
-        cold_delta = torch.zeros(b, hkv, n_cb, c_sz, device=qg.device, dtype=torch.float32)
-        sc_idx = top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, c_sz).reshape(b, hkv, t_q * self.cold_topk, c_sz)
-        cold_delta.scatter_add_(2, sc_idx, p_cw.reshape(b, hkv, t_q * self.cold_topk, c_sz))
+        y = y_final.to(v_dtype).reshape(b, self.H, t_q, hd)
+        att_p = probs_w[..., att_slice[0] : att_slice[1]] if att_slice is not None else None
+        loc_p = probs_w[..., loc_slice[0] : loc_slice[1]] if loc_slice is not None else None
+        if not has_t1:
+            cold_delta = None
+        elif not t1_topk_mode:
+            c_sz = cold_k.shape[3]
+            cold_delta = probs_w[..., cold_off : cold_off + n_cb * c_sz].mean(dim=2).sum(dim=2).view(b, hkv, n_cb, c_sz)
+        else:
+            cold_delta = torch.zeros(b, hkv, n_cb, c_sz_t1, device=qg.device, dtype=torch.float32)
+            sc_idx = top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, c_sz_t1).reshape(b, hkv, t_q * self.cold_topk, c_sz_t1)
+            cold_delta.scatter_add_(2, sc_idx, p_c.mean(dim=2).reshape(b, hkv, t_q * self.cold_topk, c_sz_t1))
         return y, att_p, loc_p, cold_delta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1052,6 +1212,11 @@ class Bolt3Decoder:
         self._diag_eye_cache: dict[torch.device, torch.Tensor] = {}
         self.C = int(model.config.get("bolt3_C", 128))
         self.use_cuda_graph = bool(kwargs.get("use_cuda_graph", True))
+        self.tier2_topk = max(0, int(kwargs.get("tier2_topk", 0)))
+        self.tier2_dir = kwargs.get("tier2_dir", None)
+        self.tier2_cache_blocks = max(0, int(kwargs.get("tier2_cache_blocks", 128)))
+        t2_mc = kwargs.get("tier2_max_cold", None)
+        self.tier2_max_cold = max(1, int(t2_mc)) if t2_mc is not None else None
         self._graph_runners: dict[tuple, _Bolt3GraphRunner] = {}
         self._gam_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._slot_t_cache: dict[tuple, list[torch.Tensor]] = {}
@@ -1143,6 +1308,9 @@ class Bolt3Decoder:
                     "cold_hit": None,
                     "cold_kmin": None,
                     "cold_kmax": None,
+                    "t2_store": None,
+                    "t2_kmin": None,
+                    "t2_kmax": None,
                     "cold_cap_blks": 0,
                     "buf_k": None,
                     "buf_v": None,
@@ -1175,6 +1343,11 @@ class Bolt3Decoder:
                     c["conv_state"].zero_()
                     c["_runner_id"] = None
                 else:
+                    if c.get("t2_store") is not None:
+                        try:
+                            c["t2_store"].close()
+                        except Exception:
+                            pass
                     for k in list(c.keys()):
                         if k in ("n_filled", "cur_len", "cur_slot", "n_loc_filled", "cold_cap_blks"):
                             c[k] = 0
@@ -1274,16 +1447,44 @@ class Bolt3Decoder:
             self._zero_m_cache[key] = zm
         return zm
 
+    def _cold_max_for(self, ly: Bolt3Attn) -> int:
+        if not ly.is_cold_armed:
+            return 0
+        return self.tier2_max_cold if self.tier2_max_cold is not None else ly.max_cold_blocks
+
+    def _layer_has_t2(self, ly: Bolt3Attn, sc: dict | None) -> bool:
+        return bool(
+            self.tier2_topk > 0
+            and ly.is_cold_armed
+            and self._cold_max_for(ly) > 0
+            and isinstance(sc, dict)
+            and sc.get("t2_kmin") is not None
+        )
+
     @staticmethod
-    def _cold_cap_for(ly: Bolt3Attn, sc: dict | None) -> int:
-        if not (ly.is_cold_armed and ly.max_cold_blocks > 0 and ly.cold_topk == 0):
+    def _cleanup_tier2(kv_caches):
+        if not kv_caches:
+            return
+        for c in kv_caches:
+            if isinstance(c, dict) and c.get("t2_store") is not None:
+                try:
+                    c["t2_store"].close()
+                except Exception:
+                    pass
+                c["t2_store"] = None
+                c["t2_kmin"] = None
+                c["t2_kmax"] = None
+
+    def _cold_cap_for(self, ly: Bolt3Attn, sc: dict | None) -> int:
+        max_cb = self._cold_max_for(ly)
+        if not (ly.is_cold_armed and max_cb > 0 and ly.cold_topk == 0):
             return 0
         ck = sc.get("cold_k_blk") if isinstance(sc, dict) else None
         n_cb = int(ck.shape[2]) if ck is not None else 0
         if n_cb <= 0:
             return 0
         cap = 16 if n_cb <= 16 else (1 << (n_cb - 1).bit_length())
-        return min(ly.max_cold_blocks, cap)
+        return min(max_cb, cap)
 
     def _sync_unified_bufs(self, sc: dict, ly: Bolt3Attn, b: int, device: torch.device, dt: torch.dtype):
         cold_cap_blks = self._cold_cap_for(ly, sc)
@@ -1479,7 +1680,8 @@ class Bolt3Decoder:
                 c_mask_f = torch.ones(b, 1, p_kp.shape[2], device=device, dtype=torch.bool)
                 tok_valid_in = None
 
-            if ly.is_cold_armed and ly.max_cold_blocks > 0:
+            cold_max_eff = self._cold_max_for(ly)
+            if ly.is_cold_armed and cold_max_eff > 0:
                 (
                     sc["cold_k_blk"],
                     sc["cold_v_blk"],
@@ -1502,11 +1704,25 @@ class Bolt3Decoder:
                     c_mask_f,
                     p_pos_f,
                     p_b_f,
+                    max_cold_blocks=cold_max_eff,
                 )
                 hb = p_hit_f.unsqueeze(2)
                 sc["cold_hit"] = hb.clone() if sc.get("cold_hit") is None else torch.cat([sc["cold_hit"], hb], dim=2)
                 if popped is not None:
                     ok_p, ok_v, ok_m, ok_pos, ok_b = popped
+                    if self.tier2_topk > 0:
+                        kmin_t2, kmax_t2 = ly._cold_block_bounds(ok_p, ok_m)
+                        store = sc.get("t2_store")
+                        if store is None:
+                            store = _Tier2BlockStore(
+                                li,
+                                base_dir=self.tier2_dir,
+                                cache_blocks=self.tier2_cache_blocks,
+                            )
+                            sc["t2_store"] = store
+                        store.append(ok_p, ok_v, ok_m)
+                        sc["t2_kmin"] = kmin_t2.clone() if sc.get("t2_kmin") is None else torch.cat([sc["t2_kmin"], kmin_t2], dim=2)
+                        sc["t2_kmax"] = kmax_t2.clone() if sc.get("t2_kmax") is None else torch.cat([sc["t2_kmax"], kmax_t2], dim=2)
                     ok_h = sc["cold_hit"][:, :, 0]
                     sc["cold_hit"] = sc["cold_hit"][:, :, 1:]
                     ok_kr = apply_rope_pos(ok_p, -ok_pos.expand(b, ly.HKV, ly.C), inv_freq)
@@ -1660,7 +1876,12 @@ class Bolt3Decoder:
             gam, _ = self._get_gam_scale(ly, device)
 
             # Fast zero-cat unified buffer path for unpadded single-token decode steps
-            if t_s == 1 and valid_mask is None and not (ly.is_cold_armed and ly.max_cold_blocks > 0 and ly.cold_topk > 0):
+            if (
+                t_s == 1
+                and valid_mask is None
+                and not (ly.is_cold_armed and self._cold_max_for(ly) > 0 and ly.cold_topk > 0)
+                and not self._layer_has_t2(ly, sc)
+            ):
                 self._sync_unified_bufs(sc, ly, b, device, x.dtype)
                 if _rope_cs is None:
                     if pos_ids is None:
@@ -1709,8 +1930,13 @@ class Bolt3Decoder:
                     self._consolidate_layer(li, ly, sc, states, b, device, inv_freq, gam, unified=True)
                 return x
 
-            # Multi-token prefill / valid_mask causal path
+            # Multi-token prefill / valid_mask causal path (detach any unified runner view before breaking sync)
+            if sc.get("buf_k") is not None:
+                for bk in ("loc_k", "loc_v", "loc_pos", "loc_b", "util_acc"):
+                    if torch.is_tensor(sc.get(bk)):
+                        sc[bk] = sc[bk].clone()
             sc["_synced_ids"] = None
+            sc["_runner_id"] = None
             sc["buf_k"] = None
             h = blk.norm1(x)
             q_r, k_r, v_n, gate = ly.head_qkv_gate(h)
@@ -1818,6 +2044,10 @@ class Bolt3Decoder:
                 att_slice=att_slice,
                 loc_slice=loc_slice,
                 q_valid_mask=valid_mask,
+                tier2_topk=self.tier2_topk,
+                t2_store=sc.get("t2_store"),
+                t2_kmin=sc.get("t2_kmin"),
+                t2_kmax=sc.get("t2_kmax"),
             )
 
             need_acc_len = ly.S + l_span
@@ -1908,8 +2138,12 @@ class Bolt3Decoder:
         if not (self._all_fast_step and len(kv_caches) == len(self.model.blocks)):
             return False
         if any(
-            isinstance(blk.attn, Bolt3Attn) and blk.attn.is_cold_armed and blk.attn.max_cold_blocks > 0 and blk.attn.cold_topk > 0
-            for blk in self.model.blocks
+            isinstance(blk.attn, Bolt3Attn)
+            and (
+                (blk.attn.is_cold_armed and self._cold_max_for(blk.attn) > 0 and blk.attn.cold_topk > 0)
+                or self._layer_has_t2(blk.attn, kv_caches[li])
+            )
+            for li, blk in enumerate(self.model.blocks)
         ):
             return False
         b = tokens.shape[0]
@@ -2159,60 +2393,63 @@ class Bolt3Decoder:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, T = ids.shape
         h, states, kv = self.prefill(ids, max_kv_len=T + max_new_tokens + 64, attn_mask=attn_mask)
-        logits = self.model.lm_head(h[:, -1, :])
-        eos = torch.tensor(sorted(eos_ids or ()), device=ids.device, dtype=torch.long)
-        done = torch.zeros(B, dtype=torch.bool, device=ids.device)
-        lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=ids.device)
-        end_think_id = close_think_ids[1] if (close_think_ids and len(close_think_ids) > 1) else None
-        closed_think = torch.zeros(B, dtype=torch.bool, device=ids.device)
-        q_pos = torch.full((B,), -1, dtype=torch.long, device=ids.device)
-        budget_trigger = max(64, max_new_tokens - 64)
-        hist = ids if repetition_penalty != 1.0 else None
-
-        if attn_mask is not None:
-            row_pos = attn_mask.long().sum(dim=-1, keepdim=True)
-        else:
-            row_pos = None
-
-        out, pos = [], T
-        for i in range(max_new_tokens):
-            nxt = self._sample(
-                logits,
-                temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                history_ids=hist,
-            )
-            if close_think_ids:
-                if i == budget_trigger:
-                    need = (~closed_think) & (~done) & (q_pos < 0)
-                    q_pos[need] = 0
-                active_q = q_pos >= 0
-                if bool(active_q.any()):
-                    for r in torch.nonzero(active_q, as_tuple=False).view(-1).tolist():
-                        nxt[r, 0] = close_think_ids[int(q_pos[r])]
-                        q_pos[r] += 1
-                        if q_pos[r] >= len(close_think_ids):
-                            q_pos[r] = -1
-                            closed_think[r] = True
-                if end_think_id is not None:
-                    closed_think |= nxt[:, 0] == end_think_id
-            out.append(nxt)
-            if hist is not None:
-                hist = torch.cat([hist, nxt], dim=1)
-            if eos.numel():
-                hit = torch.isin(nxt[:, 0], eos) & ~done
-                lengths[hit] = i + 1
-                done |= hit
-                if i % 8 == 7 and bool(done.all()):
-                    break
-            h, states, kv = self.step(nxt, pos, states, kv, pos_ids=row_pos)
+        try:
             logits = self.model.lm_head(h[:, -1, :])
-            pos += 1
-            if row_pos is not None:
-                row_pos = row_pos + 1
-        return torch.cat(out, dim=1), lengths
+            eos = torch.tensor(sorted(eos_ids or ()), device=ids.device, dtype=torch.long)
+            done = torch.zeros(B, dtype=torch.bool, device=ids.device)
+            lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=ids.device)
+            end_think_id = close_think_ids[1] if (close_think_ids and len(close_think_ids) > 1) else None
+            closed_think = torch.zeros(B, dtype=torch.bool, device=ids.device)
+            q_pos = torch.full((B,), -1, dtype=torch.long, device=ids.device)
+            budget_trigger = max(64, max_new_tokens - 64)
+            hist = ids if repetition_penalty != 1.0 else None
+
+            if attn_mask is not None:
+                row_pos = attn_mask.long().sum(dim=-1, keepdim=True)
+            else:
+                row_pos = None
+
+            out, pos = [], T
+            for i in range(max_new_tokens):
+                nxt = self._sample(
+                    logits,
+                    temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    history_ids=hist,
+                )
+                if close_think_ids:
+                    if i == budget_trigger:
+                        need = (~closed_think) & (~done) & (q_pos < 0)
+                        q_pos[need] = 0
+                    active_q = q_pos >= 0
+                    if bool(active_q.any()):
+                        for r in torch.nonzero(active_q, as_tuple=False).view(-1).tolist():
+                            nxt[r, 0] = close_think_ids[int(q_pos[r])]
+                            q_pos[r] += 1
+                            if q_pos[r] >= len(close_think_ids):
+                                q_pos[r] = -1
+                                closed_think[r] = True
+                    if end_think_id is not None:
+                        closed_think |= nxt[:, 0] == end_think_id
+                out.append(nxt)
+                if hist is not None:
+                    hist = torch.cat([hist, nxt], dim=1)
+                if eos.numel():
+                    hit = torch.isin(nxt[:, 0], eos) & ~done
+                    lengths[hit] = i + 1
+                    done |= hit
+                    if i % 8 == 7 and bool(done.all()):
+                        break
+                h, states, kv = self.step(nxt, pos, states, kv, pos_ids=row_pos)
+                logits = self.model.lm_head(h[:, -1, :])
+                pos += 1
+                if row_pos is not None:
+                    row_pos = row_pos + 1
+            return torch.cat(out, dim=1), lengths
+        finally:
+            self._cleanup_tier2(kv)
 
     @torch.no_grad()
     def generate(

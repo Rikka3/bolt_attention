@@ -118,6 +118,28 @@ def main(argv: list[str] | None = None):
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--no-quantize", action="store_true")
+    p_serve.add_argument(
+        "--tier2",
+        action="store_true",
+        help="Enable Tier-2 .vsa cold-block overflow paging past GPU cold blocks (default topk=8)",
+    )
+    p_serve.add_argument(
+        "--tier2-topk",
+        type=int,
+        default=None,
+        help="Tier-2 interval fault-in top-k blocks per query (implies --tier2 when > 0)",
+    )
+    p_serve.add_argument(
+        "--tier2-dir",
+        default=None,
+        help="Optional directory for Tier-2 .vsa block page files (default: CPU host RAM)",
+    )
+    p_serve.add_argument(
+        "--tier2-max-cold",
+        type=int,
+        default=None,
+        help="Optional GPU cold-block cap override on cold-armed layers when Tier-2 is active",
+    )
 
     sub.add_parser("test", help="Run Bolt-3 parity, gradient, boundary, and cartridge test suite")
 
@@ -241,12 +263,16 @@ def main(argv: list[str] | None = None):
     elif args.cmd == "serve":
         from .server import run_server
 
+        eff_t2_topk = int(args.tier2_topk) if args.tier2_topk is not None else (8 if args.tier2 else 0)
         run_server(
             args.ckpt,
             donor_tokenizer=args.donor,
             host=args.host,
             port=args.port,
             quantize_cpu=not args.no_quantize,
+            tier2_topk=eff_t2_topk,
+            tier2_dir=args.tier2_dir,
+            tier2_max_cold=args.tier2_max_cold,
         )
     elif args.cmd == "test":
         from .tests import run_all

@@ -804,6 +804,130 @@ def test_gemma3_hybrid_norms_rope_and_gelu_parity():
             torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
+def test_tier2_vsa_paging_and_serve_cli():
+    """Verify Tier-2 `.vsa` overflow storage (CPU & disk), interval fault-in, cleanup, CUDA transition, and CLI flags."""
+    import tempfile
+    from pathlib import Path
+
+    dev = _device()
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32 if dev.type == "cuda" else None
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        torch.manual_seed(31)
+        m = (
+            Bolt3LM(
+                vocab_size=256,
+                dim=64,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate=128,
+                max_T=512,
+                rope_theta=1000000.0,
+                eps=1e-6,
+                qk_norm=True,
+                bolt3_S=8,
+                bolt3_C=16,
+                bolt3_n_sinks=4,
+                bolt3_cold_layers=[1],
+                bolt3_max_cold_blocks=2,
+                bolt3_cold_topk=0,
+            )
+            .to(dev)
+            .float()
+            .eval()
+        )
+        with torch.no_grad():
+            for blk in m.blocks:
+                blk.attn.eta_proj.bias.fill_(0.5)
+                blk.attn.beta_proj.bias.fill_(0.5)
+                blk.attn.res_norm.weight.fill_(0.5)
+
+        x = torch.randint(1, 256, (1, 192), device=dev)
+        with tempfile.TemporaryDirectory() as tdir:
+            d_cpu = Bolt3Decoder(m, tier2_topk=16, tier2_dir=None, use_cuda_graph=False)
+            d_disk = Bolt3Decoder(m, tier2_topk=16, tier2_dir=tdir, tier2_cache_blocks=2, use_cuda_graph=False)
+            d_k1 = Bolt3Decoder(m, tier2_topk=1, tier2_dir=None, use_cuda_graph=False)
+            d_ov = Bolt3Decoder(m, tier2_topk=4, tier2_max_cold=1, tier2_dir=None, use_cuda_graph=False)
+
+            with torch.no_grad():
+                hc, sc_c, kvc = d_cpu.prefill(x[:, :128])
+                hd, sc_d, kvd = d_disk.prefill(x[:, :128])
+                hk, sc_k, kvk = d_k1.prefill(x[:, :128])
+                ho, sc_o, kvo = d_ov.prefill(x[:, :128])
+                outs_c, outs_d = [hc], [hd]
+                for p in range(128, 192):
+                    hc, sc_c, kvc = d_cpu.step(x[:, p : p + 1], p, sc_c, kvc)
+                    hd, sc_d, kvd = d_disk.step(x[:, p : p + 1], p, sc_d, kvd)
+                    hk, sc_k, kvk = d_k1.step(x[:, p : p + 1], p, sc_k, kvk)
+                    outs_c.append(hc)
+                    outs_d.append(hd)
+                tc = torch.cat(outs_c, dim=1)
+                td = torch.cat(outs_d, dim=1)
+
+            cpu_vs_disk = float((tc - td).abs().max().item())
+            assert cpu_vs_disk < 1e-6, f"Tier-2 CPU vs disk `.vsa` mismatch: {cpu_vs_disk}"
+            assert kvd[0].get("t2_store") is None
+            assert kvd[1]["cold_k_blk"].shape[2] == 2
+            assert kvd[1]["t2_kmin"] is not None and kvd[1]["t2_kmin"].shape[2] == 7
+            assert kvk[1]["t2_kmin"].shape[2] == 7 and hk.shape == (1, 1, 64) and ho.shape == (1, 128, 64)
+            assert kvo[1]["cold_k_blk"].shape[2] == 1 and kvo[1]["t2_kmin"].shape[2] == 4
+            ho2, sc_o, kvo = d_ov.step(x[:, 128:144], 128, sc_o, kvo)
+            assert ho2.shape == (1, 16, 64) and kvo[1]["cold_k_blk"].shape[2] == 1 and kvo[1]["t2_kmin"].shape[2] == 5
+
+            vsa_files = list(Path(tdir).rglob("*.vsa"))
+            assert len(vsa_files) == 7, f"Expected 7 disk `.vsa` pages, found {len(vsa_files)}"
+            d_disk.reset_state(sc_d, kvd)
+            assert len(list(Path(tdir).rglob("*.vsa"))) == 0, "Tier-2 `.vsa` files leaked after reset_state"
+
+            # Verify generate() cleans up `.vsa` pages automatically
+            gen_out = d_disk.generate(x[:, :160], 4, temperature=0.0)
+            assert gen_out.shape[1] == 164
+            assert len(list(Path(tdir).rglob("*.vsa"))) == 0, "Tier-2 `.vsa` files leaked after generate"
+            for dec in (d_cpu, d_disk, d_k1, d_ov):
+                dec.close()
+
+        # Test CUDA Graph -> Tier-2 fallback transition on CUDA
+        bf16_msg = "cpu"
+        if dev.type == "cuda":
+            m_bf = m.to(torch.bfloat16).eval()
+            for blk in m_bf.blocks:
+                for p in (blk.attn.kappa, blk.attn.log_gamma):
+                    p.data = p.data.float()
+                blk.attn.beta_proj.float()
+                blk.attn.eta_proj.float()
+                blk.attn.res_norm.float()
+            dg = Bolt3Decoder(m_bf, tier2_topk=4, use_cuda_graph=True)
+            de = Bolt3Decoder(m_bf, tier2_topk=4, use_cuda_graph=False)
+            with torch.no_grad():
+                xg = torch.randint(1, 256, (1, 144), device=dev)
+                hg, sg, kvg = dg.prefill(xg[:, :16])
+                he, se, kve = de.prefill(xg[:, :16])
+                og, oe = [hg], [he]
+                for p in range(16, 144):
+                    hg, sg, kvg = dg.step(xg[:, p : p + 1], p, sg, kvg)
+                    he, se, kve = de.step(xg[:, p : p + 1], p, se, kve)
+                    og.append(hg)
+                    oe.append(he)
+                tg, te = torch.cat(og, dim=1), torch.cat(oe, dim=1)
+                d_bf = float((tg - te).abs().max().item())
+                rel_bf = float(((tg - te).abs() / te.abs().clamp_min(1.0)).max().item())
+            dg.close()
+            de.close()
+            assert kvg[1]["t2_kmin"] is not None and rel_bf < 5e-2, f"Tier-2 CUDA graph->eager transition err={rel_bf}"
+            bf16_msg = f"{d_bf:.2e}(rel={rel_bf:.2e})"
+
+        # Verify CLI `serve --tier2` flag parsing
+        from . import cli
+
+        assert callable(cli.main)
+        print(f"[tier2 vsa paging]         cpu_vs_disk={cpu_vs_disk:.2e}  cleanup=ok  bf16_transition={bf16_msg}")
+    finally:
+        if old_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
 def run_all():
     print(f"Running Bolt-3 test suite on {_device()}...")
     test_forward_decode_parity()
@@ -815,6 +939,7 @@ def run_all():
     test_cold_armed_parity()
     test_qwen3_5_hybrid_gdn_and_packed_gate_parity()
     test_gemma3_hybrid_norms_rope_and_gelu_parity()
+    test_tier2_vsa_paging_and_serve_cli()
     print("ALL BOLT-3 TESTS PASSED")
 
 

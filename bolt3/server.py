@@ -120,9 +120,21 @@ def run_server(
     host: str = "0.0.0.0",
     port: int = 8000,
     quantize_cpu: bool = False,
+    tier2_topk: int = 0,
+    tier2_dir: str | None = None,
+    tier2_max_cold: int | None = None,
 ):
     model, tokenizer, device = load_model_for_serving(ckpt_path, donor_tokenizer, quantize_cpu=quantize_cpu)
-    decoder = Bolt3Decoder(model)
+    decoder = Bolt3Decoder(
+        model,
+        tier2_topk=tier2_topk,
+        tier2_dir=tier2_dir,
+        tier2_max_cold=tier2_max_cold,
+    )
+    if tier2_topk > 0:
+        t2_backend = f"disk:{tier2_dir}" if tier2_dir else "cpu-host"
+        t2_cap = tier2_max_cold if tier2_max_cold is not None else int(model.config.get("bolt3_max_cold_blocks", 0))
+        print(f"[bolt3-serve] Tier-2 .vsa block paging ENABLED (topk={tier2_topk}, backend={t2_backend}, gpu_cold_blocks={t2_cap})")
 
     class OpenAIHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -178,4 +190,9 @@ def run_server(
     print("=" * 78)
     print(f"Bolt-3 OpenAI API Server listening at http://{host}:{port}/v1")
     print("=" * 78)
-    HTTPServer((host, port), OpenAIHandler).serve_forever()
+    srv = HTTPServer((host, port), OpenAIHandler)
+    try:
+        srv.serve_forever()
+    finally:
+        srv.server_close()
+        decoder.close()

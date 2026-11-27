@@ -48,7 +48,9 @@ Measured on RTX PRO 6000 under paired prompts, seeds, `eval_bs=64`, `top_k=0`, `
 | **Live State RAM @64k** | `2,097.12 MB` | **`873.38 MB`** | **`-58.4%` RAM** (flat ceiling past `32k`) |
 | **Cartridge Recall (`.vsa`)** | — | **`100.0% (4/4)`** | Avg route `33.64 ms`, erase residual `0.0` (`hubcheck`: `3/3`) |
 
-> **Equal-Byte SWA & Ablation Controls (WikiText-103 KL `[mean, tail]`):** `OptB_Full` scores **`0.0660`** (`16k`) / **`0.1272`** (`64k`), beating `OptB_TrueNoAtt` (`0.1026` / `0.1853`) and `SWA_W640+Cold` (`0.0798` / `0.1464`), while slightly trailing full-byte `SWA_W898+Cold` (`0.0624` / `0.1137`) when `M_res`'s FP32 bytes are given to raw recent SWA tokens. Non-repetitive WikiText-haystack evicted NIAH (`16k_wt_4k`) remains `0/8` outside the cold cap (`4/4` inside).
+> **Equal-Byte SWA & Ablation Controls (WikiText-103 KL `[mean, tail]`):** `OptB_Full` scores **`0.0660`** (`16k`) / **`0.1272`** (`64k`), beating `OptB_TrueNoAtt` (`0.1026` / `0.1853`) and `SWA_W640+Cold` (`0.0798` / `0.1464`), while slightly trailing full-byte `SWA_W898+Cold` (`0.0624` / `0.1137`) when `M_res`'s FP32 bytes are given to raw recent SWA tokens. Non-repetitive WikiText-haystack evicted NIAH (`16k_wt_4k`) remains `0/8` outside the cold cap without Tier-2 (`--tier2`), which spills overflow blocks with interval bounds (`(t2_kmin, t2_kmax)`) for `.vsa` fault-in during serving.
+>
+> **GSM8K Thinking Cap Note (`cap=2048` vs `8192`):** Both `Qwen/Qwen3.5-4B` Donor (`49.50%`, `100/200` truncated) and Bolt-3.1 (`46.50%`, `107/200` truncated) are heavily bottlenecked by `gsm_max_new=2048` under verbose `<think>` reasoning traces. Uncapped (`max_new=8192`), prior `bolt3_1` reached **`94.0% (188/200, trunc=4/200)` vs Donor `80.5% (161/200, trunc=36/200)` (`p=0.000007`)**; paired `8192`-cap re-evaluation on `bolt3.1-qwen3.5-4b.pth` is currently finishing on Molab.
 
 ---
 
@@ -96,6 +98,8 @@ python -m bolt3 diagnose --ckpt checkpoints/bolt3.1-qwen3.5-4b.pth --donor Qwen/
 python -m bolt3 hubcheck --ckpt checkpoints/bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B
 python -m bolt3 benchmark --ckpt checkpoints/bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B --limit 200 --gsm8k-limit 200
 python -m bolt3 serve --ckpt checkpoints/bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B --port 8000
+# Optional Tier-2 `.vsa` cold-block overflow paging past GPU cold blocks (`--tier2-dir` for disk `.vsa` pages):
+python -m bolt3 serve --ckpt checkpoints/bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B --port 8000 --tier2 [--tier2-topk 8] [--tier2-dir ./vsa_pages] [--tier2-max-cold 32]
 ```
 
 ---

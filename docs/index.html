@@ -318,7 +318,7 @@ python -m bolt3 test</pre>
         <div class="ld-label">02 / Benchmark &amp; Serve Checkpoint</div>
 <pre id="cli-serve-pre">python -m bolt3 scan --ckpt bolt3.1-qwen3.5-4b.pth
 python -m bolt3 benchmark --ckpt bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B
-python -m bolt3 serve --ckpt bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B --port 8000</pre>
+python -m bolt3 serve --ckpt bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B --port 8000 --tier2</pre>
       </div>
     </div>
   </section>
@@ -350,6 +350,7 @@ python -m bolt3 serve --ckpt bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B --po
             <li>Tri-partitioned Attractors (<code>S_hh=48 + S_land=48 + S_proto=32</code>) with un-smeared updates and <code>cold_hit</code> Option-B deduplication; cut <code>16k/64k</code> WikiText KL by <code>31&ndash;36%</code> over local windows alone.</li>
             <li>Added soft-clipped <code>M_res</code> read, unrolled <code>--mres-tbptt 0</code>, frozen backbone <code>--freeze-proj</code>, and IndexMem-style <code>--evict-loss 0.5</code> (<code>L_mem</code>), activating <code>beta</code>/<code>eta</code> across all 8 Bolt-3 layers (incl. cold <code>[11, 19, 27]</code>) and lifting multi-seed NIAH to <code>75.0%</code> @ <code>64k</code> and <code>62.5%</code> @ <code>128k</code> (TruthfulQA <code>mc2</code> <code>32.19% &rarr; 34.15%</code>).</li>
             <li>Standardized Option-A filenames inside <code>rikkathree/bolt-qwen3.5-4b</code> (<code>bolt3.1-qwen3.5-4b.pth</code> + clean JSONs).</li>
+            <li>Implemented optional <strong>Tier-2 <code>.vsa</code> Cold-Block Overflow Paging</strong> (<code>bolt3 serve --tier2</code>, <code>--tier2-topk</code>, <code>--tier2-dir</code>, <code>--tier2-max-cold</code>) keeping <code>(t2_kmin, t2_kmax)</code> bounds on GPU, spilling overflow blocks to CPU/disk <code>.vsa</code> pages with exact LogSumExp fault-in (<code>0.00e+00</code> parity) and CUDA-Graph speed prior to overflow.</li>
           </ul>
         </section>
 
