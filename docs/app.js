@@ -90,7 +90,7 @@
       donor: "Qwen/Qwen3.5-4B",
       ckpt: "bolt3.1-qwen3.5-4b.pth",
       stats: [
-        ["75.0% / 62.5%", "4-Needle NIAH (64k / 128k)", "18/24 @64k • 15/24 @128k (4/4 single-pass @4k-32k)"],
+        ["75% -> 100%", "4-Needle NIAH (64k / 128k)", "Neural: 18/24 & 15/24 • --tier2: 24/24 (100%) @ 64k & 128k"],
         ["88.0% / 80.5%", "IFEval / HumanEval Parity", "Donor: IFEval 87.5% • HumanEval 80.5% • All 7 p >= 0.125"],
         ["-58.4%", "State RAM @ 64k (Flat >32k)", "873 MB vs 2,097 MB Donor (1.27x tok/s)"],
         ["1.005×", "Val PPL vs Donor (KL 0.0080)", "Top1 97.75% + TruthfulQA mc1 71.73% / mc2 34.15%"]
@@ -101,7 +101,7 @@
       layers: LAYER_SCAN_QWEN35,
       benchTitle: "Verified Against <code>Qwen/Qwen3.5-4B</code> on RTX PRO 6000",
       benchSub: "Mistral Flame = Bolt-3.1 Option-B • Blue = Qwen/Qwen3.5-4B Donor (HF eager GDN fallback; all p >= 0.125)",
-      niahHtml: "<strong>Multi-Needle NIAH, TruthfulQA &amp; Matched Controls (<code>Qwen/Qwen3.5-4B</code> Bolt-3.1):</strong> Paired single-pass 4-Needle NIAH hits <strong>4/4 (100%) at <code>4k, 16k, 32k</code></strong> and <code>2/4</code> at <code>64k</code>; multi-seed <code>64k_32k</code> reaches <strong>75.0% (18/24)</strong> and <code>128k_32k</code> reaches <strong>62.5% (15/24)</strong> (<code>d=0.10</code> evicted needles up from <code>0/8</code> to <code>2/8</code>). Beats equal-budget <code>SWA_W640+Cold</code> across <code>16k/64k</code> WikiText KL (<code>0.0660/0.1272</code> vs <code>0.0798/0.1464</code>) while still trailing full-byte <code>SWA_W898+Cold</code> (<code>0.0624/0.1137</code>). UK AISI TruthfulQA matches Donor at <strong>71.73% mc1</strong> &amp; <strong>34.15% mc2</strong> (<code>p >= 0.125</code>, <code>0</code> format errors), plus <strong>100% (4/4) Disk <code>.vsa</code> Recall</strong> (<code>0.0</code> erase residual).",
+      niahHtml: "<strong>Multi-Needle NIAH, Tier-2 <code>.vsa</code> Overflow &amp; TruthfulQA (<code>Qwen/Qwen3.5-4B</code> Bolt-3.1):</strong> Paired 4-Needle NIAH hits <strong>4/4 (100%) at <code>4k, 16k, 32k</code></strong> and <code>2/4</code> at <code>64k</code>; multi-seed pure neural reaches <strong>75.0% (18/24) @ <code>64k</code></strong> and <strong>62.5% (15/24) @ <code>128k</code></strong> (<code>d=0.10</code> up from <code>0/8</code> to <code>2/8</code>). With optional <code>--tier2</code> (<code>topk=8</code>), NIAH climbs to <strong>100.0% (24/24) at both <code>64k</code> and <code>128k</code></strong> and lifts WikiText <code>16k_wt_4k</code> from <code>4/12</code> to <strong>75.0% (9/12)</strong> identically across CPU RAM &amp; Disk <code>.vsa</code> (<code>0</code> leftover files, <code>15.62s</code> live <code>serve --tier2</code>). Beats equal-budget <code>SWA_W640+Cold</code> across <code>16k/64k</code> WikiText KL (<code>0.0660/0.1272</code> vs <code>0.0798/0.1464</code>), matches Donor TruthfulQA (<strong>71.73% mc1 / 34.15% mc2</strong>, <code>p >= 0.125</code>), and achieves <strong>100% (4/4) Disk <code>.vsa</code> Cartridge Recall</strong>.",
       maxY: 2250,
       maxLabel: "2.1G",
       tasks: [
@@ -139,7 +139,7 @@
       layers: LAYER_SCAN_QWEN3,
       benchTitle: "Verified Against <code>Qwen/Qwen3-4B</code> on RTX PRO 6000",
       benchSub: "Mistral Flame = Bolt-3 Option-B • Blue = Qwen/Qwen3-4B Donor (all p >= 0.05)",
-      niahHtml: "<strong>Needle-in-a-Haystack (WikiText-103) Diagnostic Transparency:</strong> On single-passkey retrieval (<strong>1-Needle NIAH</strong>), Qwen3-4B Option-B scored <strong>100.0% (4/4)</strong> across <code>2k, 4k, 8k, and 16k</code>. On simultaneous 4-record associative recall (<strong>4-Needle NIAH</strong>), accuracy dropped past 4k (`75% @ 4k -> 0% @ 32k`) under full 36-layer retrofit, motivating our <strong>Qwen3.5-4B</strong> hybrid release which achieves <strong>4/4 @ 32k</strong>.",
+      niahHtml: "<strong>Needle-in-a-Haystack (WikiText-103) Diagnostic Transparency:</strong> On single-passkey retrieval (<strong>1-Needle NIAH</strong>), Qwen3-4B Option-B scored <strong>100.0% (4/4)</strong> across <code>2k, 4k, 8k, and 16k</code>. On simultaneous 4-record associative recall (<strong>4-Needle NIAH</strong>), accuracy dropped past 4k (<code>75% @ 4k -&gt; 0% @ 32k</code>) under full 36-layer retrofit, motivating our <strong>Qwen3.5-4B</strong> hybrid release which achieves <strong>4/4 @ 32k</strong> (and <strong>24/24 @ 64k–128k</strong> with <code>--tier2</code>).",
       maxY: 9500,
       maxLabel: "9.2G",
       tasks: [
