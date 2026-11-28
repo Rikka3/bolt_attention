@@ -59,9 +59,9 @@
           <div class="stat-sub" id="stat-s0">Neural: 18/24 &amp; 15/24 &bull; --tier2: 24/24 (100%) @ 64k &amp; 128k</div>
         </div>
         <div class="stat-cell">
-          <div class="stat-val" id="stat-v1">88.0% / 80.5%</div>
-          <div class="stat-label" id="stat-l1">IFEval / HumanEval Parity</div>
-          <div class="stat-sub" id="stat-s1">Donor: IFEval 87.5% &bull; HumanEval 80.5% &bull; All 7 p &gt;= 0.125</div>
+          <div class="stat-val" id="stat-v1">88.0% / 83.5%</div>
+          <div class="stat-label" id="stat-l1">IFEval / GSM8K @ 8192</div>
+          <div class="stat-sub" id="stat-s1">Donor: 87.5% / 80.5% &bull; 7-Task Mean 69.57% vs 69.50%</div>
         </div>
         <div class="stat-cell">
           <div class="stat-val" id="stat-v2">-58.4%</div>
@@ -237,8 +237,8 @@
     </div>
 
     <div class="callout-niah" id="niah-callout">
-      <strong>Multi-Needle NIAH, Tier-2 <code>.vsa</code> Overflow &amp; TruthfulQA (<code>Qwen/Qwen3.5-4B</code> Bolt-3.1):</strong>
-      Paired 4-Needle NIAH hits <strong>4/4 (100%) at <code>4k, 16k, 32k</code></strong> and <code>2/4</code> at <code>64k</code>; multi-seed pure neural reaches <strong>75.0% (18/24) @ <code>64k</code></strong> and <strong>62.5% (15/24) @ <code>128k</code></strong> (<code>d=0.10</code> up from <code>0/8</code> to <code>2/8</code>). With optional <code>--tier2</code> (<code>topk=8</code>), NIAH climbs to <strong>100.0% (24/24) at both <code>64k</code> and <code>128k</code></strong> and lifts WikiText <code>16k_wt_4k</code> from <code>4/12</code> to <strong>75.0% (9/12)</strong> identically across CPU RAM &amp; Disk <code>.vsa</code> (<code>0</code> leftover files, <code>15.62s</code> live <code>serve --tier2</code>). Beats equal-budget <code>SWA_W640+Cold</code> across <code>16k/64k</code> WikiText KL (<code>0.0660/0.1272</code> vs <code>0.0798/0.1464</code>), matches Donor TruthfulQA (<strong>71.73% mc1 / 34.15% mc2</strong>, <code>p &gt;= 0.125</code>), and achieves <strong>100% (4/4) Disk <code>.vsa</code> Cartridge Recall</strong>.
+      <strong>Multi-Needle NIAH, Tier-2 <code>.vsa</code> Overflow, GSM8K @ 8192 &amp; TruthfulQA (<code>Qwen/Qwen3.5-4B</code> Bolt-3.1):</strong>
+      Uncapped <code>GSM8K (max_new=8192)</code> hits <strong>83.50% (167/200)</strong> vs Donor <code>80.50% (161/200)</code> (<code>p = 0.441</code>, lifting 7-task mean to <strong>69.57% vs 69.50%</strong>). Paired 4-Needle NIAH hits <strong>4/4 (100%) at <code>4k, 16k, 32k</code></strong> and <code>2/4</code> at <code>64k</code>; multi-seed pure neural reaches <strong>75.0% (18/24) @ <code>64k</code></strong> and <strong>62.5% (15/24) @ <code>128k</code></strong> (<code>d=0.10</code> up from <code>0/8</code> to <code>2/8</code>). With optional <code>--tier2</code> (<code>topk=8</code>), NIAH climbs to <strong>100.0% (24/24) at both <code>64k</code> and <code>128k</code></strong> and lifts WikiText <code>16k_wt_4k</code> from <code>4/12</code> to <strong>75.0% (9/12)</strong> identically across CPU RAM &amp; Disk <code>.vsa</code> (<code>0</code> leftover files, <code>15.62s</code> live <code>serve --tier2</code>). Beats equal-budget <code>SWA_W640+Cold</code> across <code>16k/64k</code> WikiText KL (<code>0.0660/0.1272</code> vs <code>0.0798/0.1464</code>), matches Donor TruthfulQA (<strong>71.73% mc1 / 34.15% mc2</strong>, <code>p &gt;= 0.125</code>), and achieves <strong>100% (4/4) Disk <code>.vsa</code> Cartridge Recall</strong>.
     </div>
   </section>
 
@@ -265,7 +265,7 @@
           24 preserved <code>GatedDeltaNet</code> + 5 pure <code>O(1)</code> <code>Bolt3Attn</code> + 3 sparse Cold-Armed <code>Bolt3Attn</code> (<code>[11, 19, 27]</code>) &bull; <code>4C=512</code> + <code>L_mem</code>
         </p>
         <div class="model-stats-row">
-          <div><div class="ld-label">IFEval / HumanEval</div><div class="ld-val">88.0% / 80.5%</div></div>
+          <div><div class="ld-label">IFEval / GSM8K</div><div class="ld-val">88.0% / 83.5%</div></div>
           <div><div class="ld-label">4-Needle NIAH</div><div class="ld-val">75% / 100% (Tier-2)</div></div>
           <div><div class="ld-label">State @ 64k</div><div class="ld-val">873.38 MB</div></div>
           <div><div class="ld-label">Decode @ 64k</div><div class="ld-val">49.3 tok/s</div></div>
@@ -350,7 +350,7 @@ python -m bolt3 serve --ckpt bolt3.1-qwen3.5-4b.pth --donor Qwen/Qwen3.5-4B --po
             <li>Tri-partitioned Attractors (<code>S_hh=48 + S_land=48 + S_proto=32</code>) with un-smeared updates and <code>cold_hit</code> Option-B deduplication; cut <code>16k/64k</code> WikiText KL by <code>31&ndash;36%</code> over local windows alone.</li>
             <li>Added soft-clipped <code>M_res</code> read, unrolled <code>--mres-tbptt 0</code>, frozen backbone <code>--freeze-proj</code>, and IndexMem-style <code>--evict-loss 0.5</code> (<code>L_mem</code>), activating <code>beta</code>/<code>eta</code> across all 8 Bolt-3 layers (incl. cold <code>[11, 19, 27]</code>) and lifting multi-seed NIAH to <code>75.0%</code> @ <code>64k</code> and <code>62.5%</code> @ <code>128k</code> (TruthfulQA <code>mc2</code> <code>32.19% &rarr; 34.15%</code>).</li>
             <li>Standardized Option-A filenames inside <code>rikkathree/bolt-qwen3.5-4b</code> (<code>bolt3.1-qwen3.5-4b.pth</code> + clean JSONs).</li>
-            <li>Implemented optional <strong>Tier-2 <code>.vsa</code> Cold-Block Overflow Paging</strong> (<code>bolt3 serve --tier2</code>, <code>--tier2-topk</code>, <code>--tier2-dir</code>, <code>--tier2-max-cold</code>) keeping <code>(t2_kmin, t2_kmax)</code> bounds on GPU, spilling overflow blocks to CPU/disk <code>.vsa</code> pages with exact LogSumExp fault-in (<code>0.00e+00</code> parity) and CUDA-Graph speed prior to overflow &mdash; hitting <strong>100% (<code>24/24</code>) at <code>64k</code> &amp; <code>128k</code></strong> and lifting <code>16k_wt_4k</code> to <strong>75.0% (<code>9/12</code>)</strong> across both CPU &amp; Disk <code>.vsa</code>.</li>
+            <li>Implemented optional <strong>Tier-2 <code>.vsa</code> Cold-Block Overflow Paging</strong> (<code>bolt3 serve --tier2</code>, <code>--tier2-topk</code>, <code>--tier2-dir</code>, <code>--tier2-max-cold</code>) keeping <code>(t2_kmin, t2_kmax)</code> bounds on GPU, spilling overflow blocks to CPU/disk <code>.vsa</code> pages with exact LogSumExp fault-in (<code>0.00e+00</code> parity) and CUDA-Graph speed prior to overflow &mdash; hitting <strong>100% (<code>24/24</code>) at <code>64k</code> &amp; <code>128k</code></strong> and lifting <code>16k_wt_4k</code> to <strong>75.0% (<code>9/12</code>)</strong> across both CPU &amp; Disk <code>.vsa</code>, while uncapped <strong><code>GSM8K @ 8192</code> reached <code>83.50%</code> vs Donor <code>80.50%</code></strong> (<code>p=0.441</code>; 7-task mean <code>69.57% vs 69.50%</code>).</li>
           </ul>
         </section>
 

@@ -37,10 +37,11 @@ Measured on RTX PRO 6000 under paired prompts, seeds, `eval_bs=64`, `top_k=0`, `
 | **MMLU** (`n=200`) | `67.50%` (`135/200`) | **`67.00%`** (`134/200`) | McNemar `p=1.000` (`0/1`) |
 | **ARC-Challenge** (`n=200`) | `51.50%` (`103/200`) | **`51.50%`** (`103/200`) | McNemar `p=1.000` (`0/0` exact tie) |
 | **HellaSwag** (`n=200`) | `62.00%` (`124/200`) | **`61.50%`** (`123/200`) | McNemar `p=1.000` (`0/1`) |
-| **GSM8K** (`n=200`, `cap=2048`) | `49.50%` (`99/200`, `trunc=100`) | **`46.50%`** (`93/200`, `trunc=107`) | McNemar `p=0.461` (`med_len=2048` cap) |
+| **GSM8K** (`n=200`, `max_new=8192`) | `80.50%` (`161/200`, `trunc=36`) | **`83.50%`** (`167/200`, `trunc=32`) | **`+3.00%`** (`24/18`, `p=0.441`, `med_len=2179`) |
 | **HumanEval** (`n=164`) | `80.49%` (`132/164`) | **`80.49%`** (`132/164`) | McNemar `p=1.000` (`2/2` exact tie) |
 | **MBPP** (`n=200`) | `57.00%` (`114/200`) | **`55.00%`** (`110/200`) | McNemar `p=0.125` (`0/4`) |
 | **IFEval** (`n=200`) | `87.50%` (`175/200`) | **`88.00%`** (`176/200`) | McNemar `p=1.000` (`3/2`) |
+| **7-Task Mean** | `69.50%` | **`69.57%`** | **`+0.07%`** overall (all `p >= 0.125`) |
 | **TruthfulQA `mc1 / mc2`** (`n=817`) | `72.22% / 34.39%` | **`71.73% / 34.15%`** | UK AISI Inspect (`p=0.125 / 0.791`, `0` fmt err) |
 | **Paired 4-Needle NIAH (`4k/16k/32k/64k`)** | `4/4 / 4/4 / 4/4 / 4/4` | **`4/4 / 4/4 / 4/4 / 2/4`** | `100%` through `32k`; multi-seed `64k_32k`: **`75.0%` (`18/24`)**, `128k_32k`: **`62.5%` (`15/24`)** |
 | **Tier-2 `.vsa` NIAH (`--tier2`, `topk=8`)** | `—` | **`100%` (`24/24`) @ `64k` & `128k`** | `16k_wt_4k` CPU & Disk `.vsa`: **`9/12` (`75.0%`, vs `4/12`)**, `0` leftover `.vsa` |
@@ -51,7 +52,7 @@ Measured on RTX PRO 6000 under paired prompts, seeds, `eval_bs=64`, `top_k=0`, `
 
 > **Equal-Byte SWA & Tier-2 Controls (WikiText-103 KL `[mean, tail]`):** `OptB_Full` scores **`0.0660`** (`16k`) / **`0.1272`** (`64k`), beating `OptB_TrueNoAtt` (`0.1026` / `0.1853`) and `SWA_W640+Cold` (`0.0798` / `0.1464`), while slightly trailing full-byte `SWA_W898+Cold` (`0.0624` / `0.1137`) when `M_res`'s FP32 bytes are given to raw recent SWA tokens. Non-repetitive WikiText-haystack evicted NIAH (`16k_wt_4k`) drops to `0/8` evicted (`4/12` overall) without Tier-2, whereas optional `--tier2` (`topk=8`) lifts `16k_wt_4k` to **`9/12` (`75.0%`, `3/4` at all depths on both CPU RAM & Disk `.vsa`)**, `64k_32k_t2` to **`24/24` (`100.0%`)**, and `128k_32k_t2` to **`24/24` (`100.0%`)**, with live OpenAI `serve --tier2` recalling buried codes past the GPU cold cap in `15.62s` (`0` leftover `.vsa` files).
 >
-> **GSM8K Thinking Cap Note (`cap=2048` vs `8192`):** Both `Qwen/Qwen3.5-4B` Donor (`49.50%`, `100/200` truncated) and Bolt-3.1 (`46.50%`, `107/200` truncated) are heavily bottlenecked by `gsm_max_new=2048` under verbose `<think>` reasoning traces. Uncapped (`max_new=8192`), prior `bolt3_1` reached **`94.0% (188/200, trunc=4/200)` vs Donor `80.5% (161/200, trunc=36/200)` (`p=0.000007`)**; paired `8192`-cap re-evaluation on `bolt3.1-qwen3.5-4b.pth` is currently finishing on Molab.
+> **GSM8K Thinking Cap (`2048` vs `8192`):** Under `gsm_max_new=2048`, both `Qwen/Qwen3.5-4B` Donor (`49.50%`, `100/200` truncated) and Bolt-3.1 (`46.50%`, `107/200` truncated, `p=0.461`) were bottlenecked by the `2048`-token reasoning cap (`med_len=2048`). Re-evaluated at `gsm_max_new=8192` on `bolt3.1-qwen3.5-4b.pth`, Bolt-3.1 achieves **`83.50% ± 5.14%` (`167/200`, `trunc=32/200`, `med_len=2179`)** vs paired HF Donor **`80.50% ± 5.49%` (`161/200`, `trunc=36/200`, `med_len=2058`)** (`p=0.4408`), lifting the 7-task mean to **`69.57%`** vs Donor `69.50%`.
 
 ---
 

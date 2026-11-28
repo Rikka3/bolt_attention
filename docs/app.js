@@ -91,7 +91,7 @@
       ckpt: "bolt3.1-qwen3.5-4b.pth",
       stats: [
         ["75% -> 100%", "4-Needle NIAH (64k / 128k)", "Neural: 18/24 & 15/24 • --tier2: 24/24 (100%) @ 64k & 128k"],
-        ["88.0% / 80.5%", "IFEval / HumanEval Parity", "Donor: IFEval 87.5% • HumanEval 80.5% • All 7 p >= 0.125"],
+        ["88.0% / 83.5%", "IFEval / GSM8K @ 8192", "Donor: 87.5% / 80.5% • 7-Task Mean 69.57% vs 69.50%"],
         ["-58.4%", "State RAM @ 64k (Flat >32k)", "873 MB vs 2,097 MB Donor (1.27x tok/s)"],
         ["1.005×", "Val PPL vs Donor (KL 0.0080)", "Top1 97.75% + TruthfulQA mc1 71.73% / mc2 34.15%"]
       ],
@@ -100,15 +100,15 @@
       defaultLayer: 11,
       layers: LAYER_SCAN_QWEN35,
       benchTitle: "Verified Against <code>Qwen/Qwen3.5-4B</code> on RTX PRO 6000",
-      benchSub: "Mistral Flame = Bolt-3.1 Option-B • Blue = Qwen/Qwen3.5-4B Donor (HF eager GDN fallback; all p >= 0.125)",
-      niahHtml: "<strong>Multi-Needle NIAH, Tier-2 <code>.vsa</code> Overflow &amp; TruthfulQA (<code>Qwen/Qwen3.5-4B</code> Bolt-3.1):</strong> Paired 4-Needle NIAH hits <strong>4/4 (100%) at <code>4k, 16k, 32k</code></strong> and <code>2/4</code> at <code>64k</code>; multi-seed pure neural reaches <strong>75.0% (18/24) @ <code>64k</code></strong> and <strong>62.5% (15/24) @ <code>128k</code></strong> (<code>d=0.10</code> up from <code>0/8</code> to <code>2/8</code>). With optional <code>--tier2</code> (<code>topk=8</code>), NIAH climbs to <strong>100.0% (24/24) at both <code>64k</code> and <code>128k</code></strong> and lifts WikiText <code>16k_wt_4k</code> from <code>4/12</code> to <strong>75.0% (9/12)</strong> identically across CPU RAM &amp; Disk <code>.vsa</code> (<code>0</code> leftover files, <code>15.62s</code> live <code>serve --tier2</code>). Beats equal-budget <code>SWA_W640+Cold</code> across <code>16k/64k</code> WikiText KL (<code>0.0660/0.1272</code> vs <code>0.0798/0.1464</code>), matches Donor TruthfulQA (<strong>71.73% mc1 / 34.15% mc2</strong>, <code>p >= 0.125</code>), and achieves <strong>100% (4/4) Disk <code>.vsa</code> Cartridge Recall</strong>.",
+      benchSub: "Mistral Flame = Bolt-3.1 Option-B • Blue = Qwen/Qwen3.5-4B Donor (HF eager GDN fallback; GSM8K @ max_new=8192; all p >= 0.125)",
+      niahHtml: "<strong>Multi-Needle NIAH, Tier-2 <code>.vsa</code> Overflow, GSM8K @ 8192 &amp; TruthfulQA (<code>Qwen/Qwen3.5-4B</code> Bolt-3.1):</strong> Uncapped <code>GSM8K (max_new=8192)</code> hits <strong>83.50% (167/200)</strong> vs Donor <code>80.50% (161/200)</code> (<code>p = 0.441</code>, lifting 7-task mean to <strong>69.57% vs 69.50%</strong>). Paired 4-Needle NIAH hits <strong>4/4 (100%) at <code>4k, 16k, 32k</code></strong> and <code>2/4</code> at <code>64k</code>; multi-seed pure neural reaches <strong>75.0% (18/24) @ <code>64k</code></strong> and <strong>62.5% (15/24) @ <code>128k</code></strong> (<code>d=0.10</code> up from <code>0/8</code> to <code>2/8</code>). With optional <code>--tier2</code> (<code>topk=8</code>), NIAH climbs to <strong>100.0% (24/24) at both <code>64k</code> and <code>128k</code></strong> and lifts WikiText <code>16k_wt_4k</code> from <code>4/12</code> to <strong>75.0% (9/12)</strong> identically across CPU RAM &amp; Disk <code>.vsa</code> (<code>0</code> leftover files, <code>15.62s</code> live <code>serve --tier2</code>). Beats equal-budget <code>SWA_W640+Cold</code> across <code>16k/64k</code> WikiText KL (<code>0.0660/0.1272</code> vs <code>0.0798/0.1464</code>), matches Donor TruthfulQA (<strong>71.73% mc1 / 34.15% mc2</strong>, <code>p >= 0.125</code>), and achieves <strong>100% (4/4) Disk <code>.vsa</code> Cartridge Recall</strong>.",
       maxY: 2250,
       maxLabel: "2.1G",
       tasks: [
         { name: "MMLU", bolt: 67.00, donor: 67.50, p: "1.000" },
         { name: "ARC-Chall.", bolt: 51.50, donor: 51.50, p: "1.000" },
         { name: "HellaSwag", bolt: 61.50, donor: 62.00, p: "1.000" },
-        { name: "GSM8K", bolt: 46.50, donor: 49.50, p: "0.461" },
+        { name: "GSM8K", bolt: 83.50, donor: 80.50, p: "0.441" },
         { name: "HumanEval", bolt: 80.49, donor: 80.49, p: "1.000" },
         { name: "MBPP", bolt: 55.00, donor: 57.00, p: "0.125" },
         { name: "IFEval", bolt: 88.00, donor: 87.50, p: "1.000" }
